@@ -30,7 +30,8 @@ dependencies = [
     "redis[hiredis] (==5.2.1)",
     "jsonpickle (==4.0.2)",
     "aiosqlite (>=0.20.0)",
-    "twikit (>=2.3.3,<3.0.0)"
+    "twikit (>=2.3.3,<3.0.0)",
+    "wikipedia-api (>=0.14.1,<0.15.0)"
 ]
 
 

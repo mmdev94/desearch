@@ -757,14 +757,14 @@ files = [
 
 [[package]]
 name = "click"
-version = "8.3.3"
+version = "8.3.2"
 description = "Composable command line interface toolkit"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "click-8.3.3-py3-none-any.whl", hash = "sha256:a2bf429bb3033c89fa4936ffb35d5cb471e3719e1f3c8a7c3fff0b8314305613"},
-    {file = "click-8.3.3.tar.gz", hash = "sha256:398329ad4837b2ff7cbe1dd166a4c0f8900c3ca3a218de04466f38f6497f18a2"},
+    {file = "click-8.3.2-py3-none-any.whl", hash = "sha256:1924d2c27c5653561cd2cae4548d1406039cb79b858b747cfea24924bbc1616d"},
+    {file = "click-8.3.2.tar.gz", hash = "sha256:14162b8b3b3550a7d479eafa77dfd3c38d9dc8951f6f69c78913a8f9a7540fd5"},
 ]
 
 [package.dependencies]
@@ -4113,6 +4113,22 @@ mpmath = ">=1.1.0,<1.4"
 dev = ["hypothesis (>=6.70.0)", "pytest (>=7.1.0)"]
 
 [[package]]
+name = "tenacity"
+version = "9.1.4"
+description = "Retry code until it succeeds"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "tenacity-9.1.4-py3-none-any.whl", hash = "sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55"},
+    {file = "tenacity-9.1.4.tar.gz", hash = "sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a"},
+]
+
+[package.extras]
+doc = ["reno", "sphinx"]
+test = ["pytest", "tornado (>=4.5)", "typeguard"]
+
+[[package]]
 name = "tiktoken"
 version = "0.12.0"
 description = "tiktoken is a fast BPE tokeniser for use with OpenAI's models"
@@ -4604,6 +4620,23 @@ beautifulsoup4 = "*"
 requests = ">=2.0.0,<3.0.0"
 
 [[package]]
+name = "wikipedia-api"
+version = "0.14.1"
+description = "Python Wrapper for Wikipedia"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "wikipedia_api-0.14.1-py3-none-any.whl", hash = "sha256:cacfdb953c3802b96605d7ac78ee42dd7fe049f28ed47e632cfe943187b83c2b"},
+    {file = "wikipedia_api-0.14.1.tar.gz", hash = "sha256:1a4ac428711f673a983be5676eb6c5fa39130fc5869893923435884e0e2c3c31"},
+]
+
+[package.dependencies]
+click = "8.3.2"
+httpx = "0.28.1"
+tenacity = "9.1.4"
+
+[[package]]
 name = "win32-setctime"
 version = "1.2.0"
 description = "A small Python utility to set file creation time on Windows"
@@ -4977,4 +5010,4 @@ requests = "*"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<3.15"
-content-hash = "326270d370a6ce32190cc40c531ce9f22ed8991642daf143e8c278d241cca926"
+content-hash = "55a7fe1b73f6b87a167ba2b51305e10b59ba9b1e1f67a87e6f6a6b484d779c73"
