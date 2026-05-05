@@ -1,0 +1,247 @@
+import os
+import traceback
+from typing import List, Optional
+
+import bittensor as bt
+from apify_client import ApifyClientAsync
+
+from desearch.protocol import (
+    TwitterScraperMedia,
+    TwitterScraperTweet,
+    TwitterScraperUser,
+)
+from desearch.services.twitter_utils import TwitterUtils
+
+APIFY_API_KEY = os.environ.get("APIFY_API_KEY")
+
+
+def toTwitterScraperTweet(item, is_quote=False):
+    if item is None:
+        return None
+
+    media_list = item.get("extendedEntities", {}).get("media", [])
+
+    media_list = [
+        TwitterScraperMedia(
+            media_url=media.get("media_url_https"), type=media.get("type")
+        )
+        for media in media_list
+    ]
+
+    author = item.get("author", {})
+    quote = item.get("quoted_tweet")
+
+    user = None
+
+    if not is_quote:
+        user = TwitterScraperUser(
+            id=author.get("id"),
+            created_at=author.get("createdAt"),
+            description=author.get("description"),
+            followers_count=author.get("followers"),
+            favourites_count=author.get("favouritesCount"),
+            listed_count=author.get("listedCount"),
+            media_count=author.get("mediaCount"),
+            statuses_count=author.get("statusesCount"),
+            verified=author.get("isVerified"),
+            is_blue_verified=author.get("isBlueVerified"),
+            profile_image_url=author.get("profilePicture"),
+            profile_banner_url=author.get("coverPicture") or None,
+            url=author.get("url"),
+            name=author.get("name"),
+            username=author.get("userName"),
+            entities=author.get("entities"),
+            can_dm=author.get("canDm"),
+            can_media_tag=author.get("canMediaTag"),
+            location=author.get("location"),
+            pinned_tweet_ids=author.get("pinnedTweetIds"),
+        )
+
+    tweet = TwitterScraperTweet(
+        id=item.get("id"),
+        text=item.get("text"),
+        reply_count=item.get("replyCount"),
+        view_count=item.get("viewCount"),
+        retweet_count=item.get("retweetCount"),
+        like_count=item.get("likeCount"),
+        quote_count=item.get("quoteCount"),
+        # impression_count=item.get("viewCount"),
+        bookmark_count=item.get("bookmarkCount"),
+        url=item.get("url"),
+        created_at=item.get("createdAt"),
+        is_quote_tweet=item.get("isQuote"),
+        is_retweet=item.get("isRetweet"),
+        media=media_list,
+        lang=item.get("lang"),
+        conversation_id=item.get("conversationId"),
+        quote=toTwitterScraperTweet(quote, is_quote=True),
+        entities=item.get("entities"),
+        extended_entities=item.get("extendedEntities"),
+        # in_reply_to_user_id=item.get("inReplyToUserId"),
+        # in_reply_to_screen_name=item.get("inReplyToUsername"),
+        in_reply_to_status_id=item.get("inReplyToId"),
+        quoted_status_id=quote.get("id") if quote else None,
+        user=user,
+    )
+
+    return tweet
+
+
+class TwitterScraperActor:
+    def __init__(self) -> None:
+        # Actor: https://apify.com/apidojo/tweet-scraper
+        self.actor_id = "61RPP7dywgiy0JPD0"
+
+        # Actor: https://apify.com/kaitoeasyapi/twitter-x-data-tweet-scraper-pay-per-result-cheapest
+        self.new_actor_id = "CJdippxWmn9uRfooo"
+        self.user_scraper_actor_id = "V38PZzpEgOfeeWvZY"
+        self.client = ApifyClientAsync(token=APIFY_API_KEY)
+
+    async def get_tweets(
+        self, urls: List[str], add_user_info: bool = True
+    ) -> List[TwitterScraperTweet]:
+        if not APIFY_API_KEY:
+            bt.logging.warning(
+                "Please set the APIFY_API_KEY environment variable. See here: https://github.com/Desearch-ai/subnet-22/blob/main/docs/env_variables.md. This will be required in the next release."
+            )
+            return []
+        try:
+            tweet_ids = [TwitterUtils.extract_tweet_id(url) for url in urls]
+            tweet_ids = [tweet_id for tweet_id in tweet_ids if tweet_id is not None]
+
+            run_input = {
+                "tweetIDs": tweet_ids,
+            }
+
+            run = await self.client.actor(self.new_actor_id).call(run_input=run_input)
+
+            tweets: List[TwitterScraperTweet] = []
+
+            async for item in self.client.dataset(
+                run["defaultDatasetId"]
+            ).iterate_items():
+                try:
+                    if (
+                        item.get("noResults")
+                        or item.get("type") == "mock_tweet"
+                        or item.get("url") == ""
+                    ):
+                        continue
+
+                    tweet = toTwitterScraperTweet(item)
+                    tweets.append(tweet)
+                except Exception as e:
+                    error_message = (
+                        f"TwitterScraperActor: Failed to scrape tweet: {str(e)}"
+                    )
+                    tb_str = traceback.format_exception(type(e), e, e.__traceback__)
+                    bt.logging.warning("\n".join(tb_str) + error_message)
+
+            return tweets
+        except Exception as e:
+            error_message = (
+                f"TwitterScraperActor: Failed to scrape tweets {urls}: {str(e)}"
+            )
+            tb_str = traceback.format_exception(type(e), e, e.__traceback__)
+            bt.logging.error("\n".join(tb_str) + error_message)
+            return []
+
+    async def get_tweets_advanced(
+        self,
+        urls: Optional[List[str]] = [],
+        author: Optional[str] = None,
+        conversationIds: Optional[List[str]] = None,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        geocode: Optional[str] = None,
+        geotaggedNear: Optional[str] = None,
+        inReplyTo: Optional[str] = None,
+        includeSearchTerms: Optional[bool] = None,
+        maxItems: Optional[int] = None,
+        mentioning: Optional[str] = None,
+        minimumFavorites: Optional[str] = None,
+        minimumReplies: Optional[str] = None,
+        minimumRetweets: Optional[str] = None,
+        onlyImage: Optional[bool] = None,
+        onlyQuote: Optional[bool] = None,
+        onlyTwitterBlue: Optional[bool] = None,
+        onlyVerifiedUsers: Optional[bool] = None,
+        onlyVideo: Optional[bool] = None,
+        placeObjectId: Optional[str] = None,
+        searchTerms: Optional[List[str]] = None,
+        sort: Optional[str] = None,
+        tweetLanguage: Optional[str] = None,
+        twitterHandles: Optional[List[str]] = None,
+        withinRadius: Optional[str] = None,
+    ) -> dict:
+        if not APIFY_API_KEY:
+            error = "Please set the APIFY_API_KEY environment variable. See here: https://github.com/Desearch-ai/subnet-22/blob/main/docs/env_variables.md. This will be required in the next release."
+            bt.logging.warning(error)
+            return {"error": error}
+        try:
+            tweet_ids = [TwitterUtils.extract_tweet_id(url) for url in (urls or [])]
+            tweet_ids = [tweet_id for tweet_id in tweet_ids if tweet_id is not None]
+
+            query_type = sort if sort in ("Top", "Latest") else "Latest"
+            terms = [t.strip() for t in (searchTerms or []) if t and t.strip()]
+
+            parts = list(terms)
+            if author:
+                parts.append(f"from:{author}")
+            if start:
+                parts.append(f"since:{start}")
+            if end:
+                parts.append(f"until:{end}")
+            if onlyVerifiedUsers:
+                parts.append("filter:verified")
+
+            twitter_content = " ".join(parts).strip()
+
+            run_input = {
+                "tweetIDs": tweet_ids,
+                "twitterContent": twitter_content,
+                "searchTerms": terms or ([twitter_content] if twitter_content else []),
+                "maxItems": maxItems,
+                "queryType": query_type,
+                "from": author or "",
+                "to": "",
+                "@": "",
+                "list": "",
+                "filter:blue_verified": bool(onlyTwitterBlue),
+                "filter:quote": bool(onlyQuote),
+                "filter:images": bool(onlyImage),
+                "filter:videos": bool(onlyVideo),
+            }
+
+            if minimumRetweets is not None:
+                run_input["min_retweets"] = int(minimumRetweets)
+            if minimumFavorites is not None:
+                run_input["min_faves"] = int(minimumFavorites)
+            if minimumReplies is not None:
+                run_input["min_replies"] = int(minimumReplies)
+            if tweetLanguage:
+                run_input["lang"] = tweetLanguage
+
+            run = await self.client.actor(self.new_actor_id).call(run_input=run_input)
+
+            tweets: List[dict] = []
+
+            async for item in self.client.dataset(
+                run["defaultDatasetId"]
+            ).iterate_items():
+                if item.get("noResults"):
+                    continue
+
+                tweet = toTwitterScraperTweet(item)
+                tweets.append(tweet)
+
+            return tweets
+        except Exception as e:
+            error_message = (
+                f"TwitterScraperActor: Failed to scrape tweets {searchTerms}: {str(e)}"
+            )
+            tb_str = traceback.format_exception(type(e), e, e.__traceback__)
+            bt.logging.warning("\n".join(tb_str) + error_message)
+            return {
+                "error": error_message,
+            }

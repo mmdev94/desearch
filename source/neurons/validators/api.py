@@ -1,0 +1,788 @@
+import os
+
+os.environ["USE_TORCH"] = "1"
+
+import asyncio
+import json
+import traceback
+from contextlib import asynccontextmanager
+from typing import List, Optional
+
+import aiohttp
+import bittensor as bt
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Path, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, conint
+
+from desearch import __version__
+from desearch.dataset.date_filters import DateFilterType
+from desearch.miner_config import SEARCH_TYPES
+from desearch.protocol import (
+    ChatHistoryItem,
+    Model,
+    ResultType,
+    TwitterScraperTweet,
+    WebSearchResultList,
+)
+from neurons.validators.clients.validator_service_client import ValidatorServiceClient
+from neurons.validators.dependencies import verify_access_key
+from neurons.validators.env import MINER_DB_PATH, PORT
+from neurons.validators.scoring import miner_db
+from neurons.validators.validator_api import ValidatorAPI
+
+
+async def get_validator_config():
+    async with ValidatorServiceClient() as client:
+        while True:
+            print("Waiting for validator service to start...")
+
+            try:
+                config = await client.get_config()
+                print("Validator config fetched successfully.")
+                return config
+            except Exception:
+                print("Waiting for validator service to start...")
+            finally:
+                await asyncio.sleep(5)
+
+
+api: ValidatorAPI = None
+validator_identity: Optional[dict] = None
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # Start the validator api when the app starts
+    global api, validator_identity
+
+    config_payload = await get_validator_config()
+    validator_identity = config_payload["validator_identity"]
+
+    await miner_db.initialize(MINER_DB_PATH, readonly=True)
+
+    api = ValidatorAPI(
+        config=config_payload["config"],
+        validator_identity=validator_identity,
+    )
+    await api.start()
+
+    try:
+        yield
+    finally:
+        if api is not None:
+            await api.stop()
+        await miner_db.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+
+available_tools = [
+    "Twitter Search",
+    "Web Search",
+    "ArXiv Search",
+    "Wikipedia Search",
+    "Youtube Search",
+    "Hacker News Search",
+    "Reddit Search",
+]
+
+twitter_tool = ["Twitter Search"]
+
+
+def format_enum_values(enum):
+    values = [value.value for value in enum]
+    values = ", ".join(values)
+
+    return f"Options: {values}"
+
+
+class SearchRequest(BaseModel):
+    prompt: str = Field(
+        ...,
+        description="Search query prompt",
+        example="What are the recent sport events?",
+    )
+
+    tools: List[str] = Field(
+        ..., description="List of tools to search with", example=available_tools
+    )
+
+    start_date: Optional[str] = Field(
+        default=None,
+        description="The start date for the search query. Format: YYYY-MM-DDTHH:MM:SSZ (UTC)",
+        example="2025-05-01T00:00:00Z",
+    )
+
+    end_date: Optional[str] = Field(
+        default=None,
+        description="The end date for the search query. Format: YYYY-MM-DDTHH:MM:SSZ (UTC)",
+        example="2025-05-03T00:00:00Z",
+    )
+
+    date_filter: Optional[DateFilterType] = Field(
+        default=DateFilterType.PAST_WEEK,
+        description=f"Predefined date filters for the search results, or you can use specific start and end dates {format_enum_values(DateFilterType)}",
+        example=DateFilterType.PAST_WEEK.value,
+    )
+
+    model: Optional[Model] = Field(
+        default=Model.NOVA,
+        description=f"Model to use for scraping. {format_enum_values(Model)}",
+        example=Model.NOVA.value,
+    )
+
+    count: Optional[int] = Field(
+        10,
+        title="Count",
+        description="The number of results to return per source. Min 10. Max 200.",
+        ge=10,
+        le=200,
+    )
+
+    result_type: Optional[ResultType] = Field(
+        default=ResultType.LINKS_WITH_FINAL_SUMMARY,
+        description=f"Type of result. {format_enum_values(ResultType)}",
+        example=ResultType.LINKS_WITH_FINAL_SUMMARY.value,
+    )
+
+    system_message: Optional[str] = Field(
+        default=None,
+        description="Rules influencing how summaries are generated",
+        example="Summarize the content by categorizing key points into 'Pros' and 'Cons' sections.",
+    )
+
+    scoring_system_message: Optional[str] = Field(
+        default=None,
+        description="System message for scoring the response",
+        example='Business Relevance Scoring Guide:\n\n                    Task: As an evaluator, determine how well a tweet represents a business opportunity for the agent based on contextual relevance to the specific agent use case provided.\n\n                    IMPORTANT: Only score highly for needs that directly relate to the agent\'s specific use case. Similar but different problems should receive lower scores unless they specifically mention the agent\'s domain.\n\n                    Agent use case: Find people who needs SERP API service and is looking for cheaper options for scraping\n\n                    Scoring Criteria:\n\n                    Score 2 - No Business Opportunity:\n                    - Criteria: Tweet is completely unrelated to the agent\'s use case or shows no indication of need for the agent\'s specific offering\n                    - Context: Author is not expressing any pain point, question, or situation relevant to the agent\'s domain\n                    - Examples:\n                    - Agent Use Case: "Find people needing SERP API services"\n                    - Tweet: "Just had amazing pizza for lunch!" → Score 2 (completely unrelated)\n                    - Tweet: "Our streaming API is having problems" → Score 2 (different API domain)\n\n                    Score 5 - Potential Interest:\n                    - Criteria: Tweet shows indirect relevance to the agent\'s domain but lacks clear intent, urgency, or specific need\n                    - Context: Author mentions related topics but doesn\'t express explicit need for the agent\'s specific solution\n                    - Examples:\n                    - Agent Use Case: "Find people needing SERP API services"\n                    - Tweet: "Working on a new web scraping project" → Score 5 (related activity, no explicit SERP need)\n                    - Tweet: "APIs are getting expensive these days" → Score 5 (general API concern, not SERP-specific)\n\n                    Score 9 - Strong Business Opportunity:\n                    - Criteria: Tweet indicates a clear need, problem, or interest that directly aligns with the agent\'s specific use case\n                    - Context: Author is seeking solutions, expressing frustration, asking for recommendations, or describing challenges specifically in the agent\'s domain\n                    - Examples:\n                    - Agent Use Case: "Find people needing SERP API services"\n                    - Tweet: "Anyone know a reliable API for Google search results? Current one keeps failing" → Score 9 (direct SERP API need)\n                    - Tweet: "SERP API costs are killing our budget, need alternatives" → Score 9 (specific SERP API problem)\n                    \n                    Output Format:\n                    Score: [2, 5, or 9], Explanation: [Brief explanation focusing on how specifically this relates to the agent\'s use case and the level of expressed need]',
+    )
+
+    chat_history: Optional[List[ChatHistoryItem]] = Field(
+        default_factory=list,
+        title="Chat History",
+        description="A list of chat history items.",
+    )
+
+
+class LinksSearchRequest(BaseModel):
+    prompt: str = Field(
+        ...,
+        description="Search query prompt",
+        example="What are the recent sport events?",
+    )
+
+    tools: List[str] = Field(
+        ..., description="List of tools to search with", example=available_tools
+    )
+
+    model: Optional[Model] = Field(
+        default=Model.NOVA,
+        description=f"Model to use for scraping. {format_enum_values(Model)}",
+        example=Model.NOVA.value,
+    )
+
+    count: Optional[int] = Field(
+        10,
+        title="Count",
+        description="The number of results to return per source. Min 10. Max 200.",
+        ge=10,
+        le=200,
+    )
+
+
+fields = "\n".join(
+    f"- {key}: {item.get('description')}"
+    for key, item in SearchRequest.model_json_schema().get("properties", {}).items()
+)
+
+SEARCH_DESCRIPTION = f"""Performs a search across multiple platforms. Available tools are:
+- Twitter Search: Uses Twitter API to search for tweets in past week date range.
+- Web Search: Searches the web.
+- ArXiv Search: Searches academic papers on ArXiv.
+- Wikipedia Search: Searches articles on Wikipedia.
+- Youtube Search: Searches videos on Youtube.
+- Hacker News Search: Searches posts on Hacker News, under the hood it uses web search.
+- Reddit Search: Searches posts on Reddit, under the hood it uses web search.
+
+Request Body Fields:
+{fields}
+"""
+
+
+async def response_stream_event(data: SearchRequest):
+    try:
+        query = {
+            "content": data.prompt,
+            "tools": data.tools,
+            "count": data.count,
+            "date_filter": data.date_filter.value,
+            "start_date": data.start_date,
+            "end_date": data.end_date,
+            "system_message": data.system_message,
+            "scoring_system_message": data.scoring_system_message,
+            "chat_history": data.chat_history,
+        }
+
+        merged_chunks = ""
+
+        async for response in api.advanced_scraper_validator.organic(
+            query,
+            data.model,
+            result_type=data.result_type,
+        ):
+            # Decode the chunk if necessary and merge
+            chunk = str(response)  # Assuming response is already a string
+            merged_chunks += chunk
+            lines = chunk.split("\n")
+            sse_data = "\n".join(f"data: {line if line else ' '}" for line in lines)
+            yield f"{sse_data}\n\n"
+    except Exception as e:
+        bt.logging.error(f"error in response_stream {traceback.format_exc()}")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+
+async def aggregate_search_results(responses: List[bt.Synapse], tools: List[str]):
+    """
+    Aggregates search results from multiple Synapse responses into a dictionary
+    with tool names as keys and their corresponding results.
+    """
+
+    # Define the mapping of tool names to response fields in Synapse
+    field_mapping = {
+        "Twitter Search": "miner_tweets",
+        "Web Search": "search_results",
+        "ArXiv Search": "arxiv_search_results",
+        "Wikipedia Search": "wikipedia_search_results",
+        "Youtube Search": "youtube_search_results",
+        "Hacker News Search": "hacker_news_search_results",
+        "Reddit Search": "reddit_search_results",
+    }
+
+    aggregated = {}
+
+    # Loop through each Synapse response
+    for synapse_index, synapse in enumerate(responses):
+        for tool in tools:
+            # Get the corresponding field name for the tool
+            field_name = field_mapping.get(tool)
+
+            try:
+                result = getattr(synapse, field_name)
+
+                if result:
+                    # If result is a list, extend the existing aggregated list
+                    if isinstance(result, list):
+                        if field_name not in aggregated:
+                            aggregated[field_name] = []
+                        aggregated[field_name].extend(result)
+
+                    # If result is a dict, just assign it
+                    elif isinstance(result, dict):
+                        aggregated[field_name] = result
+
+                    else:
+                        # Handle unexpected result types if necessary
+                        bt.logging.warning(
+                            f"Unexpected result type for tool '{tool}': {type(result)}"
+                        )
+                        aggregated[field_name] = result
+                else:
+                    # If result is None or empty, just log it
+                    bt.logging.debug(
+                        f"No data found for '{tool}' on Synapse {synapse_index}."
+                    )
+            except AttributeError:
+                pass
+
+    # Replace None values with empty dictionaries for tools with no results
+    for tool in tools:
+        field_name = field_mapping.get(tool)
+
+        if field_name not in aggregated:
+            aggregated[field_name] = []
+
+    return aggregated
+
+
+async def handle_search_links(
+    body: LinksSearchRequest,
+    tools: List[str],
+):
+    query = {"content": body.prompt, "tools": tools, "count": body.count}
+    synapses = []
+
+    bt.logging.info(f"Handle search links, query: {query}")
+
+    try:
+        async for item in api.advanced_scraper_validator.organic(
+            query,
+            body.model,
+            is_collect_final_synapses=True,
+            result_type=ResultType.ONLY_LINKS,
+        ):
+            synapses.append(item)
+
+        # Aggregate the results
+        aggregated_results = await aggregate_search_results(synapses, tools)
+
+        return aggregated_results
+
+    except Exception as e:
+        bt.logging.error(f"Error in handle_search_links: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@app.post(
+    "/search",
+    summary="Search across multiple platforms",
+    description=SEARCH_DESCRIPTION,
+    response_description="A stream of search results from the specified tools.",
+)
+async def search(body: SearchRequest, _=Depends(verify_access_key)):
+    """
+    Search endpoint that accepts a JSON body with search parameters.
+    """
+
+    bt.logging.info(f"/search request: {body}")
+
+    return StreamingResponse(response_stream_event(body))
+
+
+@app.post(
+    "/search/links/web",
+    summary="Search links across web platforms",
+    description="Search links using all tools except Twitter Search.",
+    response_description="A JSON object mapping tool names to their search results.",
+)
+async def search_links_web(body: LinksSearchRequest, _=Depends(verify_access_key)):
+    bt.logging.info(f"/search/links/web request: {body}")
+
+    return await handle_search_links(body, tools=body.tools)
+
+
+@app.post(
+    "/search/links/twitter",
+    summary="Search links on Twitter",
+    description="Search links using only Twitter Search.",
+    response_description="A JSON object mapping Twitter Search to its search results.",
+)
+async def search_links_twitter(body: LinksSearchRequest, _=Depends(verify_access_key)):
+    bt.logging.info(f"/search/links/twitter request: {body}")
+
+    return await handle_search_links(body, tools=body.tools)
+
+
+@app.post(
+    "/search/links",
+    summary="Search links for all tools",
+    description="Search links using all tools.",
+    response_description="A JSON object mapping all tools to their search results.",
+)
+async def search_links(body: LinksSearchRequest, _=Depends(verify_access_key)):
+    bt.logging.info(f"/search/links request: {body}")
+
+    return await handle_search_links(body, tools=available_tools)
+
+
+class TwitterSearchRequest(BaseModel):
+    query: Optional[str] = ""
+    sort: Optional[str] = "Top"
+    user: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    lang: Optional[str] = None
+    verified: Optional[bool] = None
+    blue_verified: Optional[bool] = None
+    is_quote: Optional[bool] = None
+    is_video: Optional[bool] = None
+    is_image: Optional[bool] = None
+    min_retweets: Optional[int] = None
+    min_replies: Optional[int] = None
+    min_likes: Optional[int] = None
+    count: Optional[conint(le=100)] = 20
+
+
+@app.post(
+    "/twitter/search",
+    summary="Twitter basic filter Search",
+    description="Using filters to search for precise results from Twitter.",
+    response_model=List[TwitterScraperTweet],
+)
+async def advanced_twitter_search(
+    request: TwitterSearchRequest, _=Depends(verify_access_key)
+):
+    """
+    Perform an advanced Twitter search using multiple filtering parameters.
+
+    Returns:
+        List[TwitterScraperTweet]: A list of fetched tweets.
+    """
+
+    bt.logging.info(f"/twitter/search request: {request}")
+
+    try:
+        bt.logging.info("Advanced Twitter search initiated with organic approach.")
+
+        query_dict = request.model_dump()
+
+        # Collect all yielded synapses from organic
+        final_synapses = []
+
+        async for synapse in api.x_scraper_validator.x_search(query=query_dict):
+            final_synapses.append(synapse)
+
+        # Transform final synapses into a flattened list of tweets
+        all_tweets = []
+
+        for syn in final_synapses:
+            # Each synapse (if successful) should have a 'results' field of TwitterScraperTweet
+            if hasattr(syn, "results") and isinstance(syn.results, list):
+                all_tweets.extend(syn.results)
+
+        return all_tweets
+    except Exception as e:
+        bt.logging.error(f"Error in advanced_twitter_search: {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+
+class TwitterURLSearchRequest(BaseModel):
+    urls: List[str]
+
+
+@app.post(
+    "/twitter/urls",
+    summary="Fetch Tweets by URLs",
+    description="Fetch details of multiple tweets using their URLs.",
+    response_model=List[TwitterScraperTweet],
+)
+async def get_tweets_by_urls(
+    request: TwitterURLSearchRequest, _=Depends(verify_access_key)
+):
+    """
+    Fetch the details of multiple tweets using their URLs.
+
+    Parameters:
+        urls (List[str]): A list of tweet URLs.
+
+    Returns:
+        List[TwitterScraperTweet]: A list of fetched tweets.
+    """
+
+    bt.logging.info(f"/twitter/urls request: {request}")
+
+    results = []
+
+    try:
+        urls = list(dict.fromkeys(request.urls))
+
+        bt.logging.info(f"Fetching tweets for URLs: {urls}")
+
+        results = await api.x_scraper_validator.x_posts_by_urls(urls)
+    except Exception as e:
+        bt.logging.error(f"Error fetching tweets by URLs: {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+    if results:
+        return results
+    else:
+        raise HTTPException(status_code=404, detail="Tweets not found")
+
+
+@app.get(
+    "/twitter/{id}",
+    summary="Fetch Tweet by ID",
+    description="Fetch details of a tweet using its unique tweet ID.",
+    response_model=TwitterScraperTweet,
+)
+async def get_tweet_by_id(
+    id: str = Path(..., description="The unique ID of the tweet to fetch"),
+    _=Depends(verify_access_key),
+):
+    """
+    Fetch the details of a tweet by its ID.
+
+    Returns:
+        List[TwitterScraperTweet]: A list containing the tweet details.
+    """
+
+    bt.logging.info(f"/twitter/id request: id={id}")
+
+    results = []
+
+    try:
+        bt.logging.info(f"Fetching tweet with ID: {id}")
+
+        results = await api.x_scraper_validator.x_post_by_id(id)
+    except Exception as e:
+        bt.logging.error(f"Error fetching tweet by ID: {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+    if results:
+        return results[0]
+    else:
+        raise HTTPException(status_code=404, detail="Tweet not found")
+
+
+@app.get(
+    "/web/search",
+    summary="Web Search",
+    description="Search the web using a query with options for result count and pagination.",
+    response_model=WebSearchResultList,
+)
+async def web_search_endpoint(
+    query: str = Query(
+        ..., description="The search query string, e.g., 'latest news on AI'."
+    ),
+    num: int = Query(10, le=100, description="The maximum number of results to fetch."),
+    start: int = Query(
+        0, description="The number of results to skip (used for pagination)."
+    ),
+    _=Depends(verify_access_key),
+):
+    """
+    Perform a web search using the given query, number of results, and start index.
+
+    Parameters:
+        query (str): The search query string.
+        num (int): The maximum number of results to fetch.
+        start (int): The number of results to skip (for pagination).
+
+    Returns:
+        List[WebSearchResult]: A list of web search results.
+    """
+
+    bt.logging.info(f"/web/search request: query={query}, num={num}, start={start}")
+
+    try:
+        bt.logging.info(
+            f"Performing web search with query: '{query}', num: {num}, start: {start}"
+        )
+
+        # Collect all yielded synapses from organic
+        final_synapses = []
+
+        async for synapse in api.web_scraper_validator.organic(
+            query={"query": query, "num": num, "start": start}
+        ):
+            final_synapses.append(synapse)
+
+        # Transform final synapses into a flattened list of links
+        results = []
+
+        for syn in final_synapses:
+            # Each synapse (if successful) should have a 'results' field of WebSearchResult
+            if hasattr(syn, "results") and isinstance(syn.results, list):
+                results.extend(syn.results)
+
+        return {"data": results}
+    except Exception as e:
+        bt.logging.error(f"Error in web search: {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+
+@app.get("/")
+async def health_check(_=Depends(verify_access_key)):
+
+    async with ValidatorServiceClient() as client:
+        try:
+            await client.health_check()
+            return {"status": "healthy", "version": __version__}
+        except aiohttp.ClientError:
+            raise HTTPException(status_code=503)
+
+
+# Public miner stats
+# TODO: refactor API in the next release
+
+
+class MinerTypeStateOut(BaseModel):
+    verified: int
+    declared: int
+    quality_avg: float
+    frozen_until: Optional[str] = None
+    unreachable_since: Optional[str] = None
+
+
+class ScoringWindowOut(BaseModel):
+    window_start: str
+    quality_score: float
+    passed: bool
+    verified_concurrency: int
+
+
+class ValidatorIdentityOut(BaseModel):
+    uid: Optional[int] = None
+    hotkey: Optional[str] = None
+    coldkey: Optional[str] = None
+    netuid: Optional[int] = None
+
+
+class MinerListItemOut(BaseModel):
+    hotkey: str
+    uid: int
+    coldkey: str
+    per_type: dict[str, MinerTypeStateOut]
+
+
+class MinerDetailOut(BaseModel):
+    hotkey: str
+    uid: int
+    coldkey: str
+    per_type: dict[str, MinerTypeStateOut]
+    windows: dict[str, List[ScoringWindowOut]]
+
+
+class MinerListResponse(BaseModel):
+    validator: ValidatorIdentityOut
+    miners: List[MinerListItemOut]
+
+
+class MinerDetailResponse(BaseModel):
+    validator: ValidatorIdentityOut
+    miner: MinerDetailOut
+
+
+def _empty_miner_state() -> dict:
+    return {
+        "verified": 1,
+        "declared": 0,
+        "quality_avg": 0.0,
+        "frozen_until": None,
+        "unreachable_since": None,
+    }
+
+
+def _miner_state_from_row(row: dict) -> dict:
+    return {
+        "verified": row["verified"],
+        "declared": row["declared"],
+        "quality_avg": row["quality_avg"],
+        "frozen_until": row["frozen_until"],
+        "unreachable_since": row["unreachable_since"],
+    }
+
+
+@app.get(
+    "/public/miners",
+    response_model=MinerListResponse,
+    summary="List active miners (no auth)",
+    description="Aggregated miner state this validator has observed over the "
+    "last scoring windows. No authentication required.",
+    tags=["miners"],
+)
+async def public_list_miners():
+    try:
+        rows = await miner_db.get_all_rows()
+    except Exception as e:
+        bt.logging.error(f"/public/miners read failed: {e}")
+        raise HTTPException(status_code=503, detail="Miner state unavailable")
+
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        hotkey = row["hotkey"]
+        entry = grouped.setdefault(
+            hotkey,
+            {
+                "hotkey": hotkey,
+                "uid": row["uid"],
+                "coldkey": row["coldkey"],
+                "per_type": {st: _empty_miner_state() for st in SEARCH_TYPES},
+            },
+        )
+        entry["per_type"][row["search_type"]] = _miner_state_from_row(row)
+
+    return {
+        "validator": validator_identity or {},
+        "miners": sorted(grouped.values(), key=lambda m: m["uid"]),
+    }
+
+
+@app.get(
+    "/public/miners/{hotkey}",
+    response_model=MinerDetailResponse,
+    summary="Per-miner state and 72h scoring history (no auth)",
+    description="Current per-search-type state plus the last 72 hours of "
+    "scoring windows. No authentication required.",
+    tags=["miners"],
+)
+async def public_miner_detail(
+    hotkey: str = Path(..., description="Miner hotkey (ss58)"),
+):
+    try:
+        rows = await miner_db.get_rows_for_hotkey(hotkey)
+    except Exception as e:
+        bt.logging.error(f"/public/miners/{{hotkey}} read failed: {e}")
+        raise HTTPException(status_code=503, detail="Miner state unavailable")
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="Miner not found")
+
+    per_type: dict[str, dict] = {st: _empty_miner_state() for st in SEARCH_TYPES}
+    for row in rows:
+        per_type[row["search_type"]] = _miner_state_from_row(row)
+
+    windows: dict[str, list] = {}
+    try:
+        for st in SEARCH_TYPES:
+            rows_win = await miner_db.get_windows_for_hotkey(hotkey, st, since_hours=72)
+            windows[st] = [
+                {
+                    "window_start": w["window_start"],
+                    "quality_score": w["quality_score"],
+                    "passed": bool(w["passed"]),
+                    "verified_concurrency": w["verified_concurrency"],
+                }
+                for w in rows_win
+            ]
+    except Exception as e:
+        bt.logging.error(f"/public/miners/{hotkey} windows read failed: {e}")
+        raise HTTPException(status_code=503, detail="Miner state unavailable")
+
+    return {
+        "validator": validator_identity or {},
+        "miner": {
+            "hotkey": hotkey,
+            "uid": rows[0]["uid"],
+            "coldkey": rows[0]["coldkey"],
+            "per_type": per_type,
+            "windows": windows,
+        },
+    }
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title="Desearch API",
+        version="1.0.0",
+        summary="API for searching across multiple platforms",
+        routes=app.routes,
+        servers=[
+            {"url": "http://localhost:8005", "description": "Desearch API"},
+        ],
+    )
+    openapi_schema["info"]["x-logo"] = {
+        "url": "https://fastapi.tiangolo.com/img/logo-margin/logo-teal.png"
+    }
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=PORT, timeout_keep_alive=300)
