@@ -35,6 +35,7 @@ if str(_REPO) not in sys.path:
 
 from solutions.web.search import (  # noqa: E402
     CREDITS_INITIAL,
+    DEFAULT_SERPER_PAGE_SIZE,
     SerperWebSearch,
     _default_keys_path,
     get_is_valid_web_search_result,
@@ -91,6 +92,18 @@ def main() -> int:
         help="Max Serper pagination requests per miner search (default 8)",
     )
     ap.add_argument(
+        "--page-size",
+        type=int,
+        default=DEFAULT_SERPER_PAGE_SIZE,
+        help="Serper results requested per page call (default 10)",
+    )
+    ap.add_argument(
+        "--max-page-workers",
+        type=int,
+        default=8,
+        help="Max concurrent page fetch workers (default 8)",
+    )
+    ap.add_argument(
         "--dry-run",
         action="store_true",
         help="Print params and exit without calling Serper or mutating api-keys.txt",
@@ -121,6 +134,8 @@ def main() -> int:
                     "max_execution_time": max_exec_dry,
                     "keys_path": str(keys_path),
                     "max_pages": args.max_pages,
+                    "page_size": args.page_size,
+                    "max_page_workers": args.max_page_workers,
                 },
                 indent=2,
             )
@@ -139,6 +154,8 @@ def main() -> int:
         client = SerperWebSearch(
             keys_path=keys_path,
             max_pages_per_query=args.max_pages,
+            page_size=args.page_size,
+            max_page_workers=args.max_page_workers,
         )
         await client.search(synapse)
 

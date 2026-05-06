@@ -80,11 +80,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Generate synthetic ai/x/web tasks from source generator."
     )
-    p.add_argument("--ai", type=int, default=1, help="Number of ai_search tasks.")
-    p.add_argument("--x", type=int, default=1, help="Number of x_search tasks.")
-    p.add_argument("--web", type=int, default=1, help="Number of web_search tasks.")
+    p.add_argument("--ai", type=int, default=0, help="Number of ai_search tasks.")
+    p.add_argument("--x", type=int, default=0, help="Number of x_search tasks.")
+    p.add_argument("--web", type=int, default=0, help="Number of web_search tasks.")
     p.add_argument("--seed", type=int, default=None)
     return p
+
+
+def _next_task_index(tasks_dir: Path) -> int:
+    max_idx = 0
+    for path in tasks_dir.glob("*.json"):
+        name = path.stem
+        prefix = name.split("_", 1)[0]
+        if prefix.isdigit():
+            max_idx = max(max_idx, int(prefix))
+    return max_idx + 1
 
 
 def main() -> int:
@@ -94,10 +104,24 @@ def main() -> int:
 
     tasks_dir = Path(__file__).resolve().parents[1] / "tasks"
     tasks_dir.mkdir(parents=True, exist_ok=True)
-    for idx, item in enumerate(items, start=1):
-        path = tasks_dir / f"{idx:04d}_{item['search_type']}.json"
+    type_dir_map = {
+        "ai_search": tasks_dir / "ai",
+        "x_search": tasks_dir / "x",
+        "web_search": tasks_dir / "web",
+    }
+    for d in type_dir_map.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    for item in items:
+        target_dir = type_dir_map.get(item["search_type"])
+        if target_dir is None:
+            continue
+        idx = _next_task_index(target_dir)
+        path = target_dir / f"{idx:04d}.json"
         path.write_text(json.dumps(item, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"Wrote {len(items)} task files to {tasks_dir}")
+        written += 1
+    print(f"Wrote {written} task files to {tasks_dir}")
     return 0
 
 
