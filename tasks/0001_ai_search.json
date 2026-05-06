@@ -1,0 +1,10 @@
+{
+  "search_type": "ai_search",
+  "query": {
+    "query": "How do storytelling techniques influence audience engagement in original series",
+    "tools": [
+      "ArXiv Search"
+    ],
+    "date_filter_type": "PAST_MONTH"
+  }
+}

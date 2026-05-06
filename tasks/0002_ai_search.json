@@ -1,0 +1,10 @@
+{
+  "search_type": "ai_search",
+  "query": {
+    "query": "How can quantum error correction improve fault tolerance",
+    "tools": [
+      "ArXiv Search"
+    ],
+    "date_filter_type": "PAST_MONTH"
+  }
+}

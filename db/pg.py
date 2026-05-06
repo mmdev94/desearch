@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import psycopg
 
@@ -37,3 +39,32 @@ def connect():
     if not url:
         raise RuntimeError("Set DATABASE_URL (e.g. in repo-root .env).")
     return psycopg.connect(url, autocommit=False)
+
+
+def load_apify_env() -> None:
+    """Load repo-root ``.env`` for Apify flows (same as :func:`load_env`)."""
+    load_env()
+
+
+@contextmanager
+def connect_ctx() -> Iterator[psycopg.Connection]:
+    """Context manager: open Postgres connection, always close on exit."""
+    conn = connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def sync_apify_account_id_sequence(conn: psycopg.Connection) -> None:
+    """Align ``apify_account_id_seq`` with current ``MAX(id)`` after manual inserts."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT setval(
+                pg_get_serial_sequence('public.apify_account', 'id'),
+                COALESCE((SELECT MAX(id) FROM public.apify_account), 0),
+                true
+            )
+            """
+        )

@@ -2,7 +2,7 @@
 """
 Fulfillment: Apify browser signup + default personal API token.
 
-Reuses ``apify/lib/auto-signup.py`` (Smailpro temp Outlook, Apify sign-up, email verify).
+Reuses ``apify/lib/auto_signup.py`` (Smailpro temp Outlook, Apify sign-up, email verify).
 Onboarding display name comes from the Outlook address (local-part heuristic) and
 optional local LLM (``OPENAI_BASE_URL`` / ``LOCAL_LLM_MODEL``; skip with ``APIFY_SKIP_NAME_LLM=1``).
 
@@ -17,8 +17,8 @@ Prerequisites: ``db/setup_db.py`` applied so ``apify_account`` includes ``api_to
 ``credit_amount``, etc.
 
 Usage:
-  python3 fulfillment/scripts/apify_fulfillment_create_account.py
-  python3 fulfillment/scripts/apify_fulfillment_create_account.py --count 5
+  poetry run python apify/create_account.py
+  poetry run python apify/create_account.py --count 5
 
 ``--count 0`` (default) runs until you interrupt (Ctrl+C). A positive ``--count N`` stops
 after N attempts (each attempt is one new browser + signup flow).
@@ -27,26 +27,13 @@ after N attempts (each attempt is one new browser + signup flow).
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
-_APIFY_LIB = _REPO_ROOT / "apify" / "lib"
-for _p in (_APIFY_LIB, _REPO_ROOT):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
-
-
-def _load_auto_signup():
-    p = _APIFY_LIB / "auto-signup.py"
-    spec = importlib.util.spec_from_file_location("apify_auto_signup_fulfillment", p)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load {p}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 def main() -> None:
@@ -59,20 +46,22 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    from apify.lib.apify_scrape_flow import build_uc_driver  # noqa: PLC0415
+    from apify.lib.auto_signup import create_single_apify_account  # noqa: PLC0415
     from db.pg import load_env  # noqa: PLC0415
 
     load_env()
 
-    from apify_scrape_flow import build_uc_driver  # noqa: E402
-    from paths_layout import DEFAULT_PROXIES_FILE  # noqa: E402
-    from proxy_pool import pick_proxy  # noqa: E402
+    pick_proxy_fn = None
+    proxies_path: Path | None = None
+    try:
+        from paths_layout import DEFAULT_PROXIES_FILE  # noqa: PLC0415
+        from proxy_pool import pick_proxy as pick_proxy_fn  # noqa: PLC0415
 
-    signup = _load_auto_signup()
-    create_acc = signup.create_single_apify_account
-
-    proxies_path = DEFAULT_PROXIES_FILE
-    if not isinstance(proxies_path, Path):
-        proxies_path = Path(proxies_path)
+        _pf = DEFAULT_PROXIES_FILE
+        proxies_path = Path(_pf) if not isinstance(_pf, Path) else _pf
+    except ImportError:
+        pass
 
     max_attempts = int(args.count)
     infinite = max_attempts <= 0
@@ -88,6 +77,12 @@ def main() -> None:
                 break
 
             label = str(attempt) if infinite else f"{attempt}/{max_attempts}"
+            px = None
+            if pick_proxy_fn and proxies_path and proxies_path.is_file():
+                try:
+                    px = pick_proxy_fn(proxies_path)
+                except Exception:
+                    px = None
             if px:
                 print(f"[fulfillment attempt {label}] Using proxy: {px.url}")
 
@@ -98,7 +93,7 @@ def main() -> None:
             )
             try:
                 print(f"\n[fulfillment attempt {label}] Apify signup + integrations API token…")
-                created = create_acc(
+                created = create_single_apify_account(
                     driver,
                     append_to=None,
                     post_signup="integrations_token",

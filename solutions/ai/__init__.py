@@ -18,6 +18,12 @@ from solutions.ai.wikipedia_api_search import (
     run_wikipedia_search_sync,
     wikipedia_search,
 )
+from solutions.ai.youtube_search_pkg import (
+    YoutubeQuery,
+    fill_youtube_results,
+    run_youtube_search_sync,
+    youtube_search,
+)
 
 __all__ = [
     "ArxivQuery",
@@ -32,5 +38,9 @@ __all__ = [
     "fill_wikipedia_results",
     "run_wikipedia_search_sync",
     "wikipedia_search",
+    "YoutubeQuery",
+    "fill_youtube_results",
+    "run_youtube_search_sync",
+    "youtube_search",
 ]
 
