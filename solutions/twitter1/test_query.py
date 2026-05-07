@@ -2,14 +2,17 @@
 """
 Manual test: ``TwitterSearchSynapse``-style stub -> ``solutions.twitter1.query.search``.
 
-Requires env credentials:
+Requires env credentials (see repo ``.env``):
+  TWITTER_EMAIL=...
   TWITTER_USERNAME=...
   TWITTER_PASSWORD=...
-  TWITTER_EMAIL=...
+
+If password login fails (common), use a cookie session file:
+  solutions/twitter1/.twitter-api-client.cookies
+(JSON with ``ct0`` and ``auth_token`` — see twitter-api-client PyPI docs.)
 
 Run from repo root:
-  python solutions/twitter1/test_query.py -q "from:MrBeast" --count 10
-  python solutions/twitter1/test_query.py -q "from:MrBeast" --count 10 --proxy "http://ip:port"
+  poetry run python solutions/twitter1/test_query.py -q "from:MrBeast" --count 10
 """
 
 from __future__ import annotations
@@ -50,7 +53,9 @@ class _TwitterSearchStub:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Twikit Twitter search (credential login).")
+    ap = argparse.ArgumentParser(
+        description="twitter-api-client search (password or cookie session)."
+    )
     ap.add_argument("-q", "--query", required=True)
     ap.add_argument("--user", default=None, help="from: user handle without @")
     ap.add_argument("--count", type=int, default=10)
@@ -58,7 +63,6 @@ def main() -> int:
     ap.add_argument("--lang", default=None)
     ap.add_argument("--start-date", default=None, dest="start_date")
     ap.add_argument("--end-date", default=None, dest="end_date")
-    ap.add_argument("--proxy", default=None, help="HTTP(S) proxy URL, e.g. http://ip:port")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -73,7 +77,7 @@ def main() -> int:
     )
 
     t0 = time.perf_counter()
-    rows: list[dict[str, Any]] = asyncio.run(search(stub, proxy=args.proxy))
+    rows: list[dict[str, Any]] = asyncio.run(search(stub))
     elapsed = time.perf_counter() - t0
 
     print(f"response_time_s={elapsed:.3f} count={len(rows)}")

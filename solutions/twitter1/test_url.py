@@ -32,7 +32,9 @@ class _TwitterURLsStub:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Twikit fetch tweets by status URLs.")
+    ap = argparse.ArgumentParser(
+        description="twitter-api-client: fetch tweets by status URLs."
+    )
     ap.add_argument(
         "--url",
         action="append",

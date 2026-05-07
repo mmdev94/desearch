@@ -1,29 +1,33 @@
 """
-Twikit-backed Twitter helpers (no Apify).
+Twitter/X helpers using ``twitter-api-client`` (PyPI).
 
-Credentials are read from environment:
+Credentials from environment (loaded from repo ``.env`` if unset):
+- ``TWITTER_EMAIL``
 - ``TWITTER_USERNAME``
 - ``TWITTER_PASSWORD``
-- ``TWITTER_EMAIL``
 
-Session cookies are cached in ``solutions/twitter1/.twikit-cookies.json``.
+Optional session cache: ``solutions/twitter1/.twitter-api-client.cookies``
+(JSON cookies file as supported by the library).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from pathlib import Path
 from typing import Any
 
-_COOKIES_FILE = Path(__file__).resolve().parent / ".twikit-cookies.json"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ENV_FILE = _REPO_ROOT / ".env"
-_ID_RE = re.compile(r"/status/(\d+)")
+_COOKIES_FILE = Path(__file__).resolve().parent / ".twitter-api-client.cookies"
+_SEARCH_TMP = Path(__file__).resolve().parent / "_search_tmp"
 
-_CLIENTS: dict[str, Any] = {}
-_CLIENT_LOCK = asyncio.Lock()
+_ID_RE = re.compile(r"/status/(\d+)")
+_ENTRY_TWEET = re.compile(r"^tweet-(\d+)$")
+
+_SCRAPER: Any = None
 
 
 def _load_repo_env() -> None:
@@ -49,7 +53,9 @@ def _require_env(name: str) -> str:
     _load_repo_env()
     value = (os.environ.get(name) or "").strip()
     if not value:
-        raise RuntimeError(f"Set {name} in environment for Twikit login.")
+        raise RuntimeError(
+            f"Set {name} in environment (or repo .env) for twitter-api-client login."
+        )
     return value
 
 
@@ -58,92 +64,222 @@ def _extract_tweet_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _get_attr(obj: Any, *names: str, default: Any = None) -> Any:
-    for name in names:
-        if hasattr(obj, name):
-            value = getattr(obj, name)
-            if value is not None:
-                return value
-    return default
+def _ensure_scraper() -> Any:
+    global _SCRAPER
+    if _SCRAPER is not None:
+        return _SCRAPER
+    try:
+        from twitter.scraper import Scraper
+    except ImportError as e:
+        raise RuntimeError(
+            "twitter-api-client is required. Install with: poetry add twitter-api-client"
+        ) from e
 
-
-def _tweet_to_dict(tweet: Any) -> dict[str, Any]:
-    user = _get_attr(tweet, "user", default=None)
-    user_name = _get_attr(user, "screen_name", "username", "name", default="")
-    tweet_id = str(_get_attr(tweet, "id", "id_str", default="") or "")
-    url = _get_attr(tweet, "url", default=None)
-    if not url and tweet_id:
-        if user_name:
-            url = f"https://x.com/{user_name}/status/{tweet_id}"
+    try:
+        if _COOKIES_FILE.is_file():
+            _SCRAPER = Scraper(cookies=str(_COOKIES_FILE))
         else:
-            url = f"https://x.com/i/status/{tweet_id}"
+            _SCRAPER = Scraper(
+                _require_env("TWITTER_EMAIL"),
+                _require_env("TWITTER_USERNAME"),
+                _require_env("TWITTER_PASSWORD"),
+            )
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            "Twitter/X login returned invalid JSON (empty or blocked response). "
+            "Password login is unreliable; export `ct0` and `auth_token` from your browser "
+            f"into JSON and save as {_COOKIES_FILE} "
+            "(see twitter-api-client docs: cookies=… / cookies file)."
+        ) from e
+    try:
+        _SCRAPER.save_cookies(str(_COOKIES_FILE))
+    except Exception:
+        pass
+    return _SCRAPER
 
-    created_at = _get_attr(tweet, "created_at", default="")
+
+def _iter_tweet_nodes(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        leg = obj.get("legacy")
+        if (
+            isinstance(leg, dict)
+            and "full_text" in leg
+            and (obj.get("rest_id") or leg.get("id_str"))
+        ):
+            yield obj
+        for v in obj.values():
+            yield from _iter_tweet_nodes(v)
+    elif isinstance(obj, list):
+        for x in obj:
+            yield from _iter_tweet_nodes(x)
+
+
+def _screen_name_from_node(node: dict) -> str:
+    try:
+        u = node.get("core", {}).get("user_results", {}).get("result", {})
+        if isinstance(u, dict):
+            leg = u.get("legacy") or {}
+            if isinstance(leg, dict) and leg.get("screen_name"):
+                return str(leg["screen_name"])
+        u2 = node.get("author", {})
+        if isinstance(u2, dict) and u2.get("username"):
+            return str(u2["username"])
+    except Exception:
+        pass
+    return ""
+
+
+def _tweet_node_to_dict(node: dict) -> dict[str, Any]:
+    leg = node.get("legacy") or {}
+    tid = str(node.get("rest_id") or leg.get("id_str") or "").strip()
+    if not tid:
+        return {}
+    text = str(leg.get("full_text") or leg.get("text") or "")
+    user_sn = _screen_name_from_node(node)
+    url = (
+        f"https://x.com/{user_sn}/status/{tid}"
+        if user_sn
+        else f"https://x.com/i/status/{tid}"
+    )
     return {
-        "id": tweet_id,
-        "text": _get_attr(tweet, "text", "full_text", default=""),
-        "reply_count": int(_get_attr(tweet, "reply_count", default=0) or 0),
-        "view_count": _get_attr(tweet, "view_count", default=None),
-        "retweet_count": int(_get_attr(tweet, "retweet_count", default=0) or 0),
-        "like_count": int(
-            _get_attr(tweet, "favorite_count", "like_count", default=0) or 0
-        ),
-        "quote_count": int(_get_attr(tweet, "quote_count", default=0) or 0),
-        "bookmark_count": int(_get_attr(tweet, "bookmark_count", default=0) or 0),
+        "id": tid,
+        "text": text,
+        "reply_count": int(leg.get("reply_count") or 0),
+        "view_count": leg.get("ext_views", {}).get("count")
+        if isinstance(leg.get("ext_views"), dict)
+        else None,
+        "retweet_count": int(leg.get("retweet_count") or 0),
+        "like_count": int(leg.get("favorite_count") or leg.get("favourite_count") or 0),
+        "quote_count": int(leg.get("quote_count") or 0),
+        "bookmark_count": int(leg.get("bookmark_count") or 0),
         "url": url,
-        "created_at": str(created_at) if created_at is not None else "",
-        "is_quote_tweet": bool(_get_attr(tweet, "is_quote_status", default=False)),
-        "is_retweet": bool(_get_attr(tweet, "is_retweet", default=False)),
+        "created_at": str(leg.get("created_at") or ""),
+        "is_quote_tweet": bool(leg.get("is_quote_status")),
+        "is_retweet": bool(leg.get("retweeted_status_result") or leg.get("retweeted_status")),
         "media": [],
-        "lang": _get_attr(tweet, "lang", default=None),
-        "conversation_id": _get_attr(tweet, "conversation_id", default=None),
-        "in_reply_to_status_id": _get_attr(tweet, "in_reply_to_status_id", default=None),
-        "quoted_status_id": _get_attr(tweet, "quoted_status_id", default=None),
+        "lang": leg.get("lang"),
+        "conversation_id": str(leg.get("conversation_id_str") or "")
+        or None,
+        "in_reply_to_status_id": leg.get("in_reply_to_status_id_str"),
+        "quoted_status_id": None,
         "user": None,
     }
 
 
-async def _get_client(proxy: str | None = None):
-    key = (proxy or "").strip()
-    if key in _CLIENTS:
-        return _CLIENTS[key]
-    async with _CLIENT_LOCK:
-        if key in _CLIENTS:
-            return _CLIENTS[key]
-        try:
-            from twikit import Client
-        except Exception as e:
-            raise RuntimeError(
-                "Twikit is required. Install with: poetry add twikit"
-            ) from e
+def _normalize_scraper_payload(raw: Any) -> list[dict[str, Any]]:
+    chunks: list[dict] = []
+    if isinstance(raw, dict):
+        chunks = [raw]
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                chunks.append(item)
+            elif isinstance(item, list):
+                for sub in item:
+                    if isinstance(sub, dict):
+                        chunks.append(sub)
 
-        client = Client("en-US", proxy=proxy or None)
-        if _COOKIES_FILE.exists():
-            try:
-                client.load_cookies(str(_COOKIES_FILE))
-                _CLIENTS[key] = client
-                return _CLIENTS[key]
-            except Exception:
-                pass
-
-        username = _require_env("TWITTER_USERNAME")
-        password = _require_env("TWITTER_PASSWORD")
-        email = _require_env("TWITTER_EMAIL")
-
-        await client.login(
-            auth_info_1=username,
-            auth_info_2=email,
-            password=password,
-        )
-        try:
-            client.save_cookies(str(_COOKIES_FILE))
-        except Exception:
-            pass
-        _CLIENTS[key] = client
-        return _CLIENTS[key]
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for chunk in chunks:
+        for node in _iter_tweet_nodes(chunk):
+            row = _tweet_node_to_dict(node)
+            tid = row.get("id")
+            if tid and tid not in seen:
+                seen.add(str(tid))
+                out.append(row)
+    return out
 
 
-def build_twikit_query_from_synapse(synapse: Any) -> str:
+def _entry_ids(entries: list[Any]) -> list[str]:
+    ids: list[str] = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        eid = str(e.get("entryId") or "")
+        m = _ENTRY_TWEET.match(eid)
+        if m:
+            ids.append(m.group(1))
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            ordered.append(i)
+    return ordered
+
+
+def _sort_to_category(sort: str | None) -> str:
+    s = (sort or "Latest").strip()
+    if s == "Top":
+        return "Top"
+    if s in ("Photos", "Media"):
+        return "Photos"
+    if s == "Videos":
+        return "Videos"
+    if s == "People":
+        return "People"
+    return "Latest"
+
+
+def _search_sync(query: str, category: str, limit: int) -> list[dict[str, Any]]:
+    from twitter.search import Search
+
+    scraper = _ensure_scraper()
+    _SEARCH_TMP.mkdir(parents=True, exist_ok=True)
+    search = Search(session=scraper.session, save=False, debug=0)
+    lim = max(1, min(int(limit), 500))
+    res = search.run(
+        queries=[{"category": category, "query": query}],
+        limit=lim,
+        retries=3,
+        out=str(_SEARCH_TMP),
+    )
+    if not res:
+        return []
+    entries = res[0] if isinstance(res[0], list) else []
+    ids = _entry_ids(entries)[:lim]
+    if not ids:
+        return []
+    raw = scraper.tweets_by_ids(ids)
+    return _normalize_scraper_payload(raw)
+
+
+async def search_tweets(
+    query: str,
+    product: str,
+    count: int,
+) -> list[dict[str, Any]]:
+    category = _sort_to_category(product)
+
+    def _run() -> list[dict[str, Any]]:
+        return _search_sync(query, category, max(1, int(count)))
+
+    return await asyncio.to_thread(_run)
+
+
+async def tweets_by_ids(tweet_ids: list[str]) -> list[dict[str, Any]]:
+    ids = [str(i).strip() for i in tweet_ids if str(i).strip()]
+    if not ids:
+        return []
+
+    def _run() -> list[dict[str, Any]]:
+        scraper = _ensure_scraper()
+        raw = scraper.tweets_by_ids(ids)
+        normalized = _normalize_scraper_payload(raw)
+        id_order = {tid: idx for idx, tid in enumerate(ids)}
+        normalized.sort(key=lambda r: id_order.get(str(r.get("id")), 9999))
+        return normalized
+
+    return await asyncio.to_thread(_run)
+
+
+async def tweets_by_urls(urls: list[str]) -> list[dict[str, Any]]:
+    ids = [_extract_tweet_id(u) for u in urls]
+    return await tweets_by_ids([i for i in ids if i])
+
+
+def build_query_from_synapse(synapse: Any) -> str:
     query = (getattr(synapse, "query", None) or "").strip()
     user = (getattr(synapse, "user", None) or "").strip()
     q_lower = query.lower()
@@ -181,29 +317,3 @@ def build_twikit_query_from_synapse(synapse: Any) -> str:
     if mre is not None and "min_replies:" not in q_lower:
         parts.append(f"min_replies:{int(mre)}")
     return " ".join(parts).strip()
-
-
-async def search_tweets(
-    query: str,
-    product: str,
-    count: int,
-    proxy: str | None = None,
-) -> list[dict[str, Any]]:
-    client = await _get_client(proxy=proxy)
-    twikit_product = product if product in ("Top", "Latest", "Media") else "Latest"
-    tweets = await client.search_tweet(query, twikit_product, count=max(1, int(count)))
-    return [_tweet_to_dict(t) for t in tweets][: max(1, int(count))]
-
-
-async def tweets_by_ids(tweet_ids: list[str]) -> list[dict[str, Any]]:
-    ids = [str(i).strip() for i in tweet_ids if str(i).strip()]
-    if not ids:
-        return []
-    client = await _get_client()
-    tweets = await client.get_tweets_by_ids(ids)
-    return [_tweet_to_dict(t) for t in tweets]
-
-
-async def tweets_by_urls(urls: list[str]) -> list[dict[str, Any]]:
-    ids = [_extract_tweet_id(u) for u in urls]
-    return await tweets_by_ids([i for i in ids if i])

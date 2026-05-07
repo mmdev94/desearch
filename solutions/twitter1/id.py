@@ -1,4 +1,4 @@
-"""Twikit fetch helper: ``TwitterIDSearchSynapse``-like input -> tweet dict results."""
+"""Fetch helper: ``TwitterIDSearchSynapse``-like input -> tweet dict results."""
 
 from __future__ import annotations
 

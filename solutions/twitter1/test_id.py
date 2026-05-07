@@ -32,7 +32,7 @@ class _TwitterIDStub:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Twikit fetch tweet by id.")
+    ap = argparse.ArgumentParser(description="twitter-api-client: fetch tweet by id.")
     ap.add_argument("--id", required=True, help="Numeric tweet id")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
