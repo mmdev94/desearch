@@ -162,8 +162,8 @@ class RedditQuery:
     """Arctic Shift post search."""
 
     query: str
-    max_items: int = 10
-    """Target number of Reddit posts (≤100)."""
+    max_items: int = 30
+    """Target number of Reddit posts (≤100); aligned with other AI-tool fetch sizes."""
 
     subreddit: Optional[str] = None
     """If set, search only this subreddit (omit fan-out)."""
@@ -222,7 +222,7 @@ async def _fetch_posts(
 async def arctic_reddit_posts_search(q: RedditQuery) -> list[dict[str, str]]:
     """Return ``SearchResultItem`` dicts for Reddit Search tool."""
 
-    max_items = max(1, min(int(q.max_items or 10), 100))
+    max_items = max(1, min(int(q.max_items or 30), 100))
 
     subs: tuple[str, ...]
     if q.subreddit and str(q.subreddit).strip():
@@ -318,7 +318,7 @@ async def fill_reddit_results(
     Set ``synapse.reddit_search_results`` from Arctic Shift.
 
     - ``query`` defaults to ``synapse.prompt``.
-    - ``max_items`` defaults to ``synapse.max_items`` or 10.
+    - ``max_items`` defaults to ``synapse.max_items`` or 30.
     - If ``subreddit`` is unset, uses first ``r/...`` in the prompt, else
       multi-subreddit fan-out with client-side keyword overlap.
     """
@@ -339,7 +339,7 @@ async def fill_reddit_results(
         kw = _strip_subreddit_mentions(kw, target_sub)
 
     n = max_items if max_items is not None else getattr(synapse, "max_items", None)
-    n = int(n or 10)
+    n = int(n or 30)
 
     rq = RedditQuery(
         query=kw,
@@ -356,7 +356,7 @@ async def fill_reddit_results(
 def run_arctic_reddit_search_sync(
     query: str,
     *,
-    max_items: int = 10,
+    max_items: int = 30,
     subreddit: Optional[str] = None,
     sort: SortOrder = "desc",
 ) -> list[dict[str, str]]:

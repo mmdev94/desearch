@@ -602,18 +602,25 @@ def _tool_query_from_analysis(
 ) -> str:
     tool_name = _KEY_TO_TOOL.get(tool_key)
     if not tool_name:
-        return fallback_query
-    rules = (task_meta.get("ai_search_analysis") or {}).get("tool_search_rules") or {}
-    tool_rule = rules.get(tool_name)
-    if not isinstance(tool_rule, dict):
-        return fallback_query
-    candidates = tool_rule.get("search_query_candidates") or []
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate.strip():
-            sanitized = _normalize_whitespace(candidate).replace('"', "").replace("'", "")
-            if sanitized:
-                return sanitized
-    return fallback_query
+        resolved = fallback_query
+    else:
+        rules = (task_meta.get("ai_search_analysis") or {}).get("tool_search_rules") or {}
+        tool_rule = rules.get(tool_name)
+        resolved = fallback_query
+        if isinstance(tool_rule, dict):
+            candidates = tool_rule.get("search_query_candidates") or []
+            for candidate in candidates:
+                if isinstance(candidate, str) and candidate.strip():
+                    sanitized = _normalize_whitespace(candidate).replace('"', "").replace(
+                        "'", ""
+                    )
+                    if sanitized:
+                        resolved = sanitized
+                        break
+    # Reddit / Arctic keyword search: keep 1–2 substantive tokens only.
+    if tool_key == "reddit":
+        return _keyword_focus_query(resolved, max_words=2)
+    return resolved
 
 
 async def _run_twitter(query: str, count: int, date_filter_type: str | None) -> list[dict[str, Any]]:
