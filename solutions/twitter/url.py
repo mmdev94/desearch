@@ -1,8 +1,7 @@
 """
-Twitter **by status URLs** miner helper: ``TwitterURLsSearchSynapse`` → Apify results.
+Twitter **by status URLs** miner helper: ``TwitterURLsSearchSynapse`` → Twexapi results.
 
-Extracts tweet ids with ``TwitterUtils.extract_tweet_id`` and calls the **new** actor
-with ``tweetIDs`` (same as ``TwitterScraperActor.get_tweets``).
+Extracts tweet ids with ``TwitterUtils.extract_tweet_id`` and resolves via tweet lookup.
 """
 
 from __future__ import annotations

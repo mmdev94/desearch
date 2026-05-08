@@ -10,6 +10,7 @@ Credentials (never commit): ``SONJJ_ACCOUNT_EMAIL`` and ``SONJJ_ACCOUNT_PASSWORD
 """
 from __future__ import annotations
 
+import html
 import os
 import random
 import re
@@ -29,6 +30,7 @@ OUTLOOK_PATTERN = re.compile(
     r"[A-Za-z0-9._%+\[\]]+@(outlook\.(com|kr|fr|com\.vn|co\.id|co\.th|com\.ar|co\.il)|hotmail\.com)(?:-2)?",
     re.I,
 )
+GMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+\[\]]+@gmail\.com(?:-2)?", re.I)
 
 # Domains offered in Smailpro “Create temporary email” (random pick per generation).
 _SMAILPRO_OUTLOOK_DOMAINS: tuple[str, ...] = (
@@ -40,15 +42,21 @@ _SMAILPRO_OUTLOOK_DOMAINS: tuple[str, ...] = (
     "outlook.co.th",
     "outlook.co.il",
 )
+_SMAILPRO_GMAIL_DOMAINS: tuple[str, ...] = ("gmail.com",)
 
 
-def _pick_smailpro_outlook_pattern() -> str:
+def _pick_smailpro_email_pattern(provider: str = "outlook") -> str:
     """
     Random Smailpro template: local part style × domain (optional ``-2`` suffix on domain in UI).
 
     Styles: ``random@domain``, ``random[real]@domain``, ``random@domain-2``, ``random[real]@domain-2``.
     """
-    domain = random.choice(_SMAILPRO_OUTLOOK_DOMAINS)
+    p = (provider or "outlook").strip().lower()
+    if p == "gmail":
+        domains = _SMAILPRO_GMAIL_DOMAINS
+    else:
+        domains = _SMAILPRO_OUTLOOK_DOMAINS
+    domain = random.choice(domains)
     style = random.randrange(4)
     if style == 0:
         return f"random@{domain}"
@@ -125,6 +133,29 @@ def extract_serper_verify_link_from_body(blob: str) -> str | None:
     )
     if m:
         return m.group(0)
+    return None
+
+
+def extract_twex_verify_link_from_body(blob: str) -> str | None:
+    """Heuristics for TwexAPI email confirmation (accounts@twexapi.io).
+
+    Email HTML often uses ``&amp;`` in ``href``; we ``html.unescape`` so the opened URL
+    matches e.g. ``https://twexapi.io/auth/callback?token_hash=...&type=email&next=%2F``.
+    """
+    if not blob:
+        return None
+    for pattern in (
+        r'href\s*=\s*"(https://twexapi\.io/auth/callback[^"]*)"',
+        r"href\s*=\s*'(https://twexapi\.io/auth/callback[^']*)'",
+        r"https://twexapi\.io/auth/callback\?[^\s\"'<>]+",
+    ):
+        m = re.search(pattern, blob, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        raw = m.group(1) if m.lastindex else m.group(0)
+        link = html.unescape((raw or "").strip()).rstrip(").,;\"']")
+        if "token_hash=" in link and "twexapi.io/auth/callback" in link.lower():
+            return link
     return None
 
 
@@ -458,7 +489,7 @@ def _ensure_smailpro_work_window(driver, main_handle: str) -> None:
     _switch_to_window_other_than(driver, main_handle)
 
 
-def _click_create_and_generate_outlook(driver) -> None:
+def _click_create_and_generate_email(driver, *, provider: str = "outlook") -> None:
     wait = WebDriverWait(driver, 45)
     create_btn = wait.until(EC.element_to_be_clickable(_create_button_locator()))
     _scroll_center_and_js_click(driver, create_btn)
@@ -477,7 +508,8 @@ def _click_create_and_generate_outlook(driver) -> None:
             )
         )
     )
-    want = _pick_smailpro_outlook_pattern()
+    p = (provider or "outlook").strip().lower()
+    want = _pick_smailpro_email_pattern(p)
     print(f"[Smailpro/UI] email pattern field: {want}")
     cur = (email_input.get_attribute("value") or "").strip()
     if cur != want:
@@ -512,20 +544,30 @@ def _click_create_and_generate_outlook(driver) -> None:
         except Exception:
             break
         time.sleep(0.5)
-    # Left sidebar often lags the modal closing; wait before scraping the new Outlook row.
+    # Left sidebar often lags the modal closing; wait before scraping the new address row.
     time.sleep(random.uniform(2.0, 3.0))
 
 
-def _first_outlook_address_from_sidebar(driver) -> str | None:
-    """First list row labeled Outlook — ``div.font-semibold`` email text."""
-    rows = driver.find_elements(
-        By.XPATH,
-        "//li[.//span[contains(.,'Outlook')]]//div[contains(@class,'font-semibold')]",
-    )
+def _first_address_from_sidebar(driver, *, provider: str = "outlook") -> str | None:
+    """Read first generated inbox address from left sidebar for selected provider."""
+    p = (provider or "outlook").strip().lower()
+    patt = GMAIL_PATTERN if p == "gmail" else OUTLOOK_PATTERN
+    if p == "gmail":
+        rows = driver.find_elements(
+            By.XPATH,
+            "//li[.//span[contains(.,'Gmail') or contains(.,'Google')]]//div[contains(@class,'font-semibold')]",
+        )
+    else:
+        rows = driver.find_elements(
+            By.XPATH,
+            "//li[.//span[contains(.,'Outlook') or contains(.,'Microsoft')]]//div[contains(@class,'font-semibold')]",
+        )
+    if not rows:
+        rows = driver.find_elements(By.XPATH, "//li//div[contains(@class,'font-semibold')]")
     for el in rows:
         try:
             t = (el.text or "").strip()
-            if OUTLOOK_PATTERN.search(t):
+            if patt.search(t):
                 return t
         except Exception:
             continue
@@ -539,11 +581,16 @@ def _first_outlook_address_from_sidebar(driver) -> str | None:
     return None
 
 
-def _read_outlook_address_after_generate(driver, *, poll_seconds: float = 18.0) -> str | None:
+def _read_address_after_generate(
+    driver,
+    *,
+    provider: str = "outlook",
+    poll_seconds: float = 18.0,
+) -> str | None:
     """Poll sidebar briefly after Generate — list can lag the modal closing."""
     end = time.time() + max(5.0, poll_seconds)
     while time.time() < end:
-        addr = _first_outlook_address_from_sidebar(driver)
+        addr = _first_address_from_sidebar(driver, provider=provider)
         if addr:
             return addr
         time.sleep(0.45)
@@ -556,9 +603,10 @@ def create_inbox_with_rotation(
     apify_root: Path,
     usage_file: Path | None = None,
     reuse_mail_session: bool = False,
+    provider: str = "outlook",
 ) -> tuple[str, str, None]:
     """
-    Create a temp Outlook on Smailpro UI, return address.
+    Create a temp Smailpro inbox (provider: Outlook or Gmail), return address.
 
     - ``reuse_mail_session=False`` (default): close prior Smailpro/Sonjj tabs, Sonjj login tab,
       full temp-email + user-menu sync, then Create / Generate.
@@ -572,6 +620,10 @@ def create_inbox_with_rotation(
     _ = apify_root
     _ = usage_file
     main_handle = driver.current_window_handle
+    p = (provider or "outlook").strip().lower()
+    if p not in {"outlook", "gmail"}:
+        raise ValueError("provider must be 'outlook' or 'gmail'")
+    provider_label = "Gmail" if p == "gmail" else "Outlook"
     addr: str | None = None
 
     if reuse_mail_session:
@@ -579,12 +631,12 @@ def create_inbox_with_rotation(
             _ensure_smailpro_work_window(driver, main_handle)
             _load_smailpro_temp_email_light_for_retry(driver)
             for attempt in range(1, 4):
-                _click_create_and_generate_outlook(driver)
-                addr = _read_outlook_address_after_generate(driver, poll_seconds=22.0)
+                _click_create_and_generate_email(driver, provider=p)
+                addr = _read_address_after_generate(driver, provider=p, poll_seconds=22.0)
                 if addr:
                     break
                 print(
-                    "[Smailpro/UI] Sidebar did not show Outlook after Generate; "
+                    f"[Smailpro/UI] Sidebar did not show {provider_label} after Generate; "
                     f"retrying Create flow (attempt {attempt}/3)."
                 )
                 try:
@@ -594,10 +646,10 @@ def create_inbox_with_rotation(
                 time.sleep(random.uniform(0.6, 1.1))
             if not addr:
                 raise RuntimeError(
-                    "Could not read a new Outlook address from Smailpro sidebar after Generate "
+                    f"Could not read a new {provider_label} address from Smailpro sidebar after Generate "
                     "(retried Create/Generate, reuse session)."
                 )
-            print(f"[Smailpro/UI] temp Outlook inbox: address={addr}")
+            print(f"[Smailpro/UI] temp {provider_label} inbox: address={addr}")
         finally:
             driver.switch_to.window(main_handle)
         return addr, addr, None
@@ -620,12 +672,12 @@ def create_inbox_with_rotation(
     try:
         _load_smailpro_temp_email_and_sync(driver)
         for attempt in range(1, 4):
-            _click_create_and_generate_outlook(driver)
-            addr = _read_outlook_address_after_generate(driver, poll_seconds=22.0)
+            _click_create_and_generate_email(driver, provider=p)
+            addr = _read_address_after_generate(driver, provider=p, poll_seconds=22.0)
             if addr:
                 break
             print(
-                "[Smailpro/UI] Sidebar did not show Outlook after Generate; "
+                f"[Smailpro/UI] Sidebar did not show {provider_label} after Generate; "
                 f"retrying Create flow (attempt {attempt}/3)."
             )
             try:
@@ -635,10 +687,10 @@ def create_inbox_with_rotation(
             time.sleep(random.uniform(0.6, 1.1))
         if not addr:
             raise RuntimeError(
-                "Could not read a new Outlook address from Smailpro sidebar after Generate "
+                f"Could not read a new {provider_label} address from Smailpro sidebar after Generate "
                 "(retried Create/Generate)."
             )
-        print(f"[Smailpro/UI] temp Outlook inbox: address={addr}")
+        print(f"[Smailpro/UI] temp {provider_label} inbox: address={addr}")
     except Exception:
         try:
             driver.close()
@@ -653,6 +705,14 @@ def create_inbox_with_rotation(
 
 def _click_sidebar_row_for_email(driver, email: str) -> None:
     """Select the list row whose primary line matches ``email``."""
+    for li in driver.find_elements(By.XPATH, "//li"):
+        try:
+            for div in li.find_elements(By.CSS_SELECTOR, "div.font-semibold, div[class*='font-semibold']"):
+                if (div.text or "").strip() == email.strip():
+                    driver.execute_script("arguments[0].click();", li)
+                    return
+        except Exception:
+            continue
     for li in driver.find_elements(
         By.XPATH,
         "//li[.//span[contains(.,'Outlook')] or .//span[contains(.,'Microsoft')]]",
@@ -876,6 +936,186 @@ def find_serper_verification_link(
                     pass
         except Exception as ex:
             print(f"[Smailpro/UI] poll: {type(ex).__name__}: {ex}")
+
+        time.sleep(poll_seconds * 0.75)
+
+    try:
+        driver.switch_to.window(main_handle)
+    except Exception:
+        pass
+    return None
+
+
+def _open_twex_callback_from_smailpro(driver, url: str, *, main_handle: str) -> None:
+    """
+    Open the Twex email confirmation URL in a **new** tab while still on Smailpro, then
+    switch to that tab so the same browser profile (cookies from signup) completes verification.
+
+    If ``window.open`` does not create a tab (blocked / flaky), fall back to ``driver.get``
+    on ``main_handle`` (the Twex signup window).
+    """
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("empty Twex callback URL")
+    before = set(driver.window_handles)
+    try:
+        driver.execute_script("window.open(arguments[0], '_blank');", url)
+        WebDriverWait(driver, 25).until(lambda d: len(set(d.window_handles) - before) >= 1)
+        new_hs = [h for h in driver.window_handles if h not in before]
+        driver.switch_to.window(new_hs[-1])
+        WebDriverWait(driver, 120).until(
+            lambda d: "twexapi.io" in ((d.current_url or "").lower())
+        )
+        print("[Smailpro/UI] Twex callback loaded in new tab.")
+    except Exception as ex:
+        print(
+            f"[Smailpro/UI] New-tab callback failed ({type(ex).__name__}: {ex}); "
+            "navigating main window."
+        )
+        try:
+            driver.switch_to.window(main_handle)
+        except Exception:
+            pass
+        driver.get(url)
+        WebDriverWait(driver, 120).until(
+            lambda d: "twexapi.io" in ((d.current_url or "").lower())
+        )
+
+
+def find_twex_verification_link(
+    driver,
+    email: str,
+    *,
+    timeout_seconds: int = 300,
+    poll_seconds: float = 3.0,
+) -> str | None:
+    """
+    On the Smailpro tab, select inbox, refresh, open Twex message, parse callback link,
+    then open that URL in a **new** tab and switch to it (session completes on twexapi.io).
+
+    Expected: from ``accounts@twexapi.io``, link like
+    ``https://twexapi.io/auth/callback?token_hash=...&type=email&...``
+    """
+    main_handle = driver.current_window_handle
+    sm_handle = _find_window_by_url_contains(driver, "smailpro.com")
+    if not sm_handle:
+        sm_handle = _find_window_by_url_contains(driver, "my.sonjj.com")
+    if not sm_handle:
+        print("[Smailpro/UI] No Smailpro tab found; open temporary-email in a second tab.")
+        return None
+
+    driver.switch_to.window(sm_handle)
+    try:
+        cur = driver.current_url or ""
+    except Exception:
+        cur = ""
+    if "temporary-email" not in cur or "smailpro.com" not in cur:
+        try:
+            _load_smailpro_temp_email_and_sync(driver)
+        except Exception:
+            try:
+                driver.get(SMAILPRO_TEMP_URL)
+                time.sleep(1.2)
+            except Exception:
+                pass
+    else:
+        _smailpro_sync_session_via_user_menu(driver)
+
+    end = time.time() + timeout_seconds
+    while time.time() < end:
+        try:
+            _click_sidebar_row_for_email(driver, email)
+
+            for sel in (
+                (By.CSS_SELECTOR, "button#refresh"),
+                (By.CSS_SELECTOR, "[aria-label='refresh']"),
+                (By.XPATH, "//button[@title='refresh']"),
+            ):
+                try:
+                    ref = driver.find_element(*sel)
+                    if ref.is_displayed():
+                        driver.execute_script("arguments[0].click();", ref)
+                        break
+                except Exception:
+                    continue
+
+            time.sleep(max(1.0, poll_seconds * 0.5))
+
+            _lo = "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'"
+            twex_row = None
+            for xp in (
+                # Preferred: explicit subject card shown in the inbox list.
+                f"//div[contains(@class,'cursor-pointer')][.//h3[contains(translate(normalize-space(.), {_lo}), 'confirm your twexapi account')]]",
+                # Fallbacks: sender text or generic Twex subject variations.
+                f"//div[contains(@class,'cursor-pointer')][contains(translate(normalize-space(.), {_lo}), 'twexapi')]",
+                f"//*[contains(translate(., {_lo}), 'accounts@twexapi.io')]",
+                f"//h3[contains(translate(., {_lo}), 'twexapi')]",
+            ):
+                try:
+                    for node in driver.find_elements(By.XPATH, xp):
+                        if not node.is_displayed():
+                            continue
+                        twex_row = node
+                        if "cursor-pointer" not in (twex_row.get_attribute("class") or ""):
+                            twex_row = node.find_element(
+                                By.XPATH,
+                                "./ancestor::div[contains(@class,'cursor-pointer')][1]",
+                            )
+                        break
+                    if twex_row:
+                        break
+                except Exception:
+                    continue
+
+            if twex_row:
+                driver.execute_script("arguments[0].click();", twex_row)
+                # Wait until the message modal is open before reading iframe srcdoc.
+                try:
+                    WebDriverWait(driver, 8).until(
+                        EC.visibility_of_element_located(
+                            (
+                                By.XPATH,
+                                "//div[contains(@class,'max-w-2xl') and .//h3[normalize-space()='Message']]",
+                            )
+                        )
+                    )
+                except Exception:
+                    pass
+                time.sleep(0.9)
+
+                iframes = driver.find_elements(
+                    By.XPATH,
+                    "//div[contains(@class,'max-w-2xl') and .//h3[normalize-space()='Message']]//iframe[@srcdoc]",
+                )
+                if not iframes:
+                    iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[srcdoc]")
+                for fr in iframes:
+                    srcdoc = fr.get_attribute("srcdoc") or ""
+                    link = extract_twex_verify_link_from_body(srcdoc)
+                    if link:
+                        print("[Smailpro/UI] Twex verify link found in message iframe.")
+                        _open_twex_callback_from_smailpro(driver, link, main_handle=main_handle)
+                        return link
+                try:
+                    # Fallback: parse the currently open modal/container HTML.
+                    modal_blob = ""
+                    for modal in driver.find_elements(
+                        By.XPATH,
+                        "//div[contains(@class,'max-w-2xl') and .//h3[normalize-space()='Message']]",
+                    ):
+                        txt = modal.get_attribute("innerHTML") or ""
+                        if txt:
+                            modal_blob += txt
+                    blob = modal_blob or driver.page_source
+                    link = extract_twex_verify_link_from_body(blob)
+                    if link:
+                        print("[Smailpro/UI] Twex verify link found in message view.")
+                        _open_twex_callback_from_smailpro(driver, link, main_handle=main_handle)
+                        return link
+                except Exception:
+                    pass
+        except Exception as ex:
+            print(f"[Smailpro/UI] poll (Twex): {type(ex).__name__}: {ex}")
 
         time.sleep(poll_seconds * 0.75)
 

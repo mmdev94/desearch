@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Reset DB schema for Apify account storage.
+Reset DB schema for automation account storage.
 
 Behavior:
-- Drops all tables in ``public`` except ``apify_account``.
-- Creates/ensures ``apify_account`` and related indexes (idempotent).
+- Drops all tables in ``public`` except ``apify_account`` and ``twex_account``.
+- Creates/ensures both tables and related indexes (idempotent).
 
-``apify_account`` holds automation fields (email, password, full_name, mailbox fields,
-``api_token``, ``credit_amount``, unique lower(email)). ``credit_amount`` is a float
-(e.g. 0.5, 5.0) for usage/credits tracking.
+``apify_account`` and ``twex_account`` both hold automation fields:
+email, password, API key/token and credit amount, with unique lower(email).
 
-On upgrade, rows with ``credit_amount`` NULL get backfilled: **2.0** when ``password``
-is not null (active credentials), **0.0** otherwise. Existing non-NULL ``credit_amount``
-values are left unchanged.
+On upgrade, rows with ``credit_amount`` NULL are backfilled:
+- ``apify_account``: **2.0** when ``password`` is not null, else **0.0**.
+- ``twex_account``: **20000.0** when ``email``, ``password`` and ``api_key`` are all present,
+  else **0.0**.
+Existing non-NULL ``credit_amount`` values are left unchanged.
 
 Usage:
   python db/setup_db.py
@@ -39,7 +40,7 @@ BEGIN
     SELECT tablename
     FROM pg_tables
     WHERE schemaname = 'public'
-      AND tablename NOT IN ('apify_account')
+      AND tablename NOT IN ('apify_account', 'twex_account')
   LOOP
     EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', r.tablename);
   END LOOP;
@@ -63,6 +64,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_apify_account_email_lower
   ON public.apify_account (lower(trim(email)));
 """
 
+CREATE_TWEX_ACCOUNT_SQL = """
+CREATE TABLE IF NOT EXISTS public.twex_account (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    email TEXT NOT NULL,
+    password TEXT,
+    api_key TEXT,
+    credit_amount DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_twex_account_email_lower
+  ON public.twex_account (lower(trim(email)));
+"""
+
 _APIFY_ACCOUNT_UPGRADE_SQL = (
     "ALTER TABLE public.apify_account ADD COLUMN IF NOT EXISTS api_token TEXT",
     "ALTER TABLE public.apify_account ADD COLUMN IF NOT EXISTS credit_amount DOUBLE PRECISION",
@@ -80,6 +95,26 @@ WHERE credit_amount IS NULL
     "ALTER TABLE public.apify_account DROP COLUMN IF EXISTS api_run_count",
 )
 
+_TWEX_ACCOUNT_UPGRADE_SQL = (
+    "ALTER TABLE public.twex_account ADD COLUMN IF NOT EXISTS api_key TEXT",
+    "ALTER TABLE public.twex_account ADD COLUMN IF NOT EXISTS credit_amount DOUBLE PRECISION",
+    r"""
+UPDATE public.twex_account
+SET credit_amount = CASE
+    WHEN email IS NOT NULL
+         AND trim(email) <> ''
+         AND password IS NOT NULL
+         AND trim(password) <> ''
+         AND api_key IS NOT NULL
+         AND trim(api_key) <> '' THEN 20000.0
+    ELSE 0.0
+END
+WHERE credit_amount IS NULL
+""".strip(),
+    "ALTER TABLE public.twex_account ALTER COLUMN credit_amount SET DEFAULT 0",
+    "ALTER TABLE public.twex_account ALTER COLUMN credit_amount SET NOT NULL",
+)
+
 
 def main() -> int:
     load_env()
@@ -94,14 +129,20 @@ def main() -> int:
         with conn.cursor() as cur:
             cur.execute(DROP_OTHER_PUBLIC_TABLES_SQL)
             cur.execute(CREATE_APIFY_ACCOUNT_SQL)
+            cur.execute(CREATE_TWEX_ACCOUNT_SQL)
             for stmt in _APIFY_ACCOUNT_UPGRADE_SQL:
+                cur.execute(stmt)
+            for stmt in _TWEX_ACCOUNT_UPGRADE_SQL:
                 cur.execute(stmt)
             cur.execute(
                 "ALTER TABLE public.apify_account ALTER COLUMN password DROP NOT NULL"
             )
+            cur.execute(
+                "ALTER TABLE public.twex_account ALTER COLUMN password DROP NOT NULL"
+            )
         conn.commit()
         print(
-            "DB reset complete: apify_account is ready "
+            "DB reset complete: apify_account + twex_account are ready "
             "(other public tables dropped)."
         )
     finally:

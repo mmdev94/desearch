@@ -2,7 +2,8 @@
 """
 Manual test: ``TwitterSearchSynapse``-style stub → ``solutions.twitter.query.search``.
 
-Requires ``APIFY_API_KEY``. From repo root:
+Requires at least one row in ``public.twex_account`` with ``api_key`` and credits.
+From repo root:
 
   python solutions/twitter/test_query.py -q "from:elonmusk bitcoin" --count 5
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -45,7 +47,7 @@ class _TwitterSearchStub:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Apify Twitter search (new actor).")
+    ap = argparse.ArgumentParser(description="Twexapi Twitter search.")
     ap.add_argument("-q", "--query", required=True, help="Search query (TwitterSearchSynapse.query)")
     ap.add_argument("--user", default=None, help="from: user handle without @")
     ap.add_argument("--count", type=int, default=10, help="maxItems / count")
@@ -54,7 +56,15 @@ def main() -> int:
     ap.add_argument("--start-date", default=None, dest="start_date")
     ap.add_argument("--end-date", default=None, dest="end_date")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--log",
+        action="store_true",
+        help="Enable detailed Twex debug logs (raw request/response).",
+    )
     args = ap.parse_args()
+
+    if args.log:
+        os.environ["TWEX_DEBUG_LOG"] = "1"
 
     stub = _TwitterSearchStub(
         query=args.query,

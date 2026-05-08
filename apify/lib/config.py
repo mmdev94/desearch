@@ -15,7 +15,7 @@ BROWSER_FINGERPRINT = True
 HUMAN_BEHAVIOR = False
 
 # When True, add --incognito (only if no custom --user-data-dir is passed to build_uc_driver).
-INCOGNITO = True
+INCOGNITO = False
 
 # final_auto_flow: one persistent Chrome profile directory per worker
 # (<CHROME_PROFILES_ROOT>/worker_00, worker_01, …). Avoids sharing one user-data dir across drivers.

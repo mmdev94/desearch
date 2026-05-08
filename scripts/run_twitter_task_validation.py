@@ -3,11 +3,12 @@
 
 Behavior:
 - Loads task from ``tasks/x/<id>.json`` (id can be ``1`` or ``0001``).
-- Runs current Twitter miner solution: ``solutions.twitter.query.search``.
+- Runs current Twitter miner solution: ``solutions.twitter.search``.
 - Runs X validation scoring from source (same weights/perf curve as ``XScraperValidator``).
-- Apify tweet re-fetch in ``TwitterBasicSearchContentRelevanceModel.process_tweets`` is
-  bypassed and treated as pass by injecting ``validator_tweets`` from the same sampled
-  miner row (so content checks align without a second network scrape).
+- Validator-side tweet re-fetch in
+  ``TwitterBasicSearchContentRelevanceModel.process_tweets`` is bypassed and treated
+  as pass by injecting ``validator_tweets`` from the same sampled miner row
+  (so content checks align without a second network scrape).
 """
 
 from __future__ import annotations
@@ -100,7 +101,7 @@ async def _inject_validator_tweets_from_miner_sample(
     responses: list[Any],
     TwitterScraperTweet: Any,
 ) -> list[dict]:
-    """Skip Apify re-scrape; treat sampled miner tweet as validator ground truth."""
+    """Skip external re-scrape; treat sampled miner tweet as validator ground truth."""
     out: list[dict] = [{} for _ in responses]
     for response in responses:
         if not response.results:
@@ -126,7 +127,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     from neurons.validators.reward.twitter_basic_search_content_relevance import (
         TwitterBasicSearchContentRelevanceModel,
     )
-    from solutions.twitter.query import search as twitter_search
+    from solutions.twitter import search as twitter_search
 
     task_path = _resolve_task_path(args.task)
     if not task_path.is_file():
@@ -214,7 +215,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "process_time_seconds": round(elapsed, 4),
         },
         "validation": {
-            "apify_rescrape_check": "BYPASSED_AS_PASS",
+            "external_rescrape_check": "BYPASSED_AS_PASS",
             "quality_score": round(quality_score, 6),
             "performance_score": round(performance_score, 6),
             "weights": {

@@ -1,7 +1,5 @@
 """
-Twitter **by tweet id** miner helper: ``TwitterIDSearchSynapse`` → Apify results.
-
-Uses the **new** actor with ``tweetIDs`` (same path as ``TwitterScraperActor.get_tweets``).
+Twitter **by tweet id** miner helper: ``TwitterIDSearchSynapse`` → Twexapi results.
 """
 
 from __future__ import annotations

@@ -7,5 +7,90 @@
       "Hacker News Search"
     ],
     "date_filter_type": "PAST_24_HOURS"
+  },
+  "ai_search_analysis": {
+    "model": "gpt-4.1-nano",
+    "generated_at": "2026-05-07T19:35:18.588084+00:00",
+    "schema_version": "1.0",
+    "task_classification": {
+      "format": "analytic_brief",
+      "summary": "Assess how recent advancements in quantum cryptography are influencing cybersecurity practices.",
+      "is_full_question_prompt": "false",
+      "core_information_need": "Impact of quantum cryptography advancements on cybersecurity"
+    },
+    "main_content_hypothesis": "Quantum cryptography advancements are enhancing cybersecurity measures and protocols",
+    "canonical_keywords_for_validation": [
+      "quantum cryptography",
+      "cybersecurity practices",
+      "advancements",
+      "security protocols",
+      "quantum key distribution",
+      "cryptography breakthroughs"
+    ],
+    "entities": [
+      "quantum cryptography",
+      "cybersecurity"
+    ],
+    "cross_tool_notes": "Both Twitter and web sources should reflect recent discussions or reports on quantum cryptography's impact, emphasizing recent developments within the past 24 hours, with Twitter highlighting public discourse and web sources providing technical or industry insights.",
+    "tool_search_rules": {
+      "Twitter Search": {
+        "search_query_candidates": [
+          "quantum cryptography cybersecurity",
+          "quantum cryptography impact",
+          "quantum cryptography advancements"
+        ],
+        "must_cover_in_snapshot_text": [
+          "quantum cryptography",
+          "cybersecurity",
+          "advancements",
+          "security practices"
+        ],
+        "avoid_ambiguity_notes": "Focus on recent (past 24 hours) discussions specifically about technological impacts, not general or unrelated topics.",
+        "date_filter_hints": "Ensure tweets are from the last 24 hours to capture the latest developments."
+      },
+      "Hacker News Search": {
+        "search_query_candidates": [
+          "quantum cryptography cybersecurity",
+          "quantum cryptography impact",
+          "quantum cryptography advancements"
+        ],
+        "must_cover_in_snapshot_text": [
+          "quantum cryptography",
+          "cybersecurity",
+          "security protocols",
+          "breakthroughs"
+        ],
+        "avoid_ambiguity_notes": "Prioritize recent HN stories discussing technical or industry impacts, avoid outdated or unrelated threads.",
+        "date_filter_hints": "Filter for posts within the past 24 hours to ensure recency."
+      }
+    },
+    "summary_citation_plan": {
+      "suggested_outline_headers": [
+        "Recent Quantum Cryptography Breakthroughs",
+        "Impact on Cybersecurity Practices",
+        "Industry and Academic Perspectives"
+      ],
+      "link_budget": {
+        "minimum_distinct_domains": 4,
+        "notes": "Citations should include at least one from Twitter, one from Hacker News, and additional authoritative sources such as research papers or industry reports."
+      }
+    },
+    "risk_flags": [
+      "Potential mismatch if sources discuss outdated or unrelated cryptography topics",
+      "Fast-moving news may lead to incomplete or speculative information"
+    ],
+    "_consistency_hints": {
+      "tools_in_task": [
+        "Twitter Search",
+        "Hacker News Search"
+      ],
+      "tools_analyzed_keys": [
+        "Twitter Search",
+        "Hacker News Search"
+      ],
+      "missing_tool_keys_vs_task": [],
+      "extra_keys_not_in_task": [],
+      "analysis_schema_version": "1.0"
+    }
   }
 }

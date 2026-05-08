@@ -5,17 +5,31 @@ This is intended as a drop-in helper for AI search flows that need to populate
 ``ScraperStreamingSynapse.hacker_news_search_results`` with ``SearchResultItem``-shaped dicts.
 
 API: https://hn.algolia.com/api
+
+**Links** are always ``https://news.ycombinator.com/item?id=…`` so validators treat them
+as ``ycombinator.com`` and attribute them to ``hacker_news_search_results`` (see
+``search_content_relevance.check_response_random_link``). External story URLs from
+Algolia are not used.
+
+**Snippets** are plain text from ``story_text`` / ``comment_text`` or stripped
+``_highlightResult`` fragments—no raw highlight dict blobs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
+from html import unescape
 from typing import Any, Literal, Optional
 
 import aiohttp
 
 HN_ALGOLIA_BASE = "https://hn.algolia.com/api/v1"
+HN_ITEM_BASE = "https://news.ycombinator.com/item"
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>", re.DOTALL)
+_EMP_TAG_RE = re.compile(r"</?em>", re.IGNORECASE)
 
 
 SearchMode = Literal["search", "search_by_date"]
@@ -30,23 +44,65 @@ class HackerNewsQuery:
     tags: Optional[list[str]] = None
 
 
-def _hn_item_to_search_result(hit: dict[str, Any]) -> Optional[dict[str, str]]:
+def _strip_html_to_text(raw: str) -> str:
+    if not raw or not isinstance(raw, str):
+        return ""
+    t = _HTML_TAG_RE.sub(" ", raw)
+    t = _EMP_TAG_RE.sub("", t)
+    t = unescape(t)
+    return " ".join(t.split()).strip()
+
+
+def _highlight_snippet_plain(hit: dict[str, Any]) -> str:
+    hr = hit.get("_highlightResult")
+    if not isinstance(hr, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("story_text", "comment_text", "title"):
+        blk = hr.get(key)
+        if isinstance(blk, dict):
+            val = blk.get("value")
+            if isinstance(val, str) and val.strip():
+                parts.append(_strip_html_to_text(val))
+    return " ".join(parts).strip()
+
+
+def _snippet_from_hit(hit: dict[str, Any]) -> str:
+    for key in ("story_text", "comment_text"):
+        raw = hit.get(key)
+        if isinstance(raw, str) and raw.strip():
+            sn = _strip_html_to_text(raw.strip())
+            if sn:
+                return sn[:1500]
+    hl = _highlight_snippet_plain(hit)
+    if hl:
+        return hl[:1500]
     title = (hit.get("title") or hit.get("story_title") or "").strip()
-    url = (hit.get("url") or hit.get("story_url") or "").strip()
-    if not url:
-        object_id = hit.get("objectID")
-        if object_id:
-            url = f"https://news.ycombinator.com/item?id={object_id}"
-    if not title or not url:
+    if title:
+        return title[:800]
+    return "Hacker News"
+
+
+def _canonical_hn_item_link(hit: dict[str, Any]) -> Optional[str]:
+    """Always news.ycombinator.com so domain attribution matches ``hacker_news_search_results``."""
+    oid = hit.get("objectID")
+    if oid is None or str(oid).strip() == "":
+        return None
+    return f"{HN_ITEM_BASE}?id={str(oid).strip()}"
+
+
+def _hn_item_to_search_result(hit: dict[str, Any]) -> Optional[dict[str, str]]:
+    link = _canonical_hn_item_link(hit)
+    if not link:
         return None
 
-    snippet = (hit.get("story_text") or hit.get("comment_text") or hit.get("_highlightResult") or "")
-    if isinstance(snippet, dict):
-        snippet = ""
-    if not isinstance(snippet, str):
-        snippet = ""
+    title = (hit.get("title") or hit.get("story_title") or "").strip()
+    if not title:
+        title = f"Hacker News item {hit.get('objectID', '')}".strip()
 
-    return {"title": title, "link": url, "snippet": snippet}
+    snippet = _snippet_from_hit(hit)
+
+    return {"title": title, "link": link, "snippet": snippet}
 
 
 async def hn_algolia_search(q: HackerNewsQuery) -> list[dict[str, str]]:

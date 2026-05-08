@@ -32,7 +32,9 @@ dependencies = [
     "aiosqlite (>=0.20.0)",
     "wikipedia-api (>=0.14.1,<0.15.0)",
     "undetected-chromedriver (>=3.5.5,<4.0.0)",
-    "twitter-api-client (==0.10.22)"
+    "twitter-api-client (==0.10.22)",
+    "selenium-wire (>=5.1,<6)",
+    "blinker (==1.6.3)"
 ]
 
 
