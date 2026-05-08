@@ -1,9 +1,0 @@
-# Serper API keys — format: API_KEY<TAB>remaining_credits
-# Managed by solutions/web/search.py (credits decrease by number of Serper HTTP calls).
-876ca6c7788b29836659275874748a9cdc81ee79	2454
-e4ee6ddb528e1c34399eb1dc784167dff524865d	2452
-376c476187891c1fee59b3f5b35b86730c8ccf4d	2455
-e4968847b96572833fa3dbb154dfb7662bdb2914	2455
-8e20a40350306d7c2c2ff87843168cbd91203f58	2455
-e1c73ffce5a11c054ac621eab444ccce95b6f710	2455
-516badc9f101c3bb5f1f5ba740c96e6ede5fddb2	2457

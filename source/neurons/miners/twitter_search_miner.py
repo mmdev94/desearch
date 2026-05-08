@@ -1,85 +1,162 @@
-import bittensor as bt
+import time
+
 from desearch.protocol import (
-    TwitterSearchSynapse,
     TwitterIDSearchSynapse,
+    TwitterSearchSynapse,
     TwitterURLsSearchSynapse,
 )
-from neurons.validators.apify.twitter_scraper_actor import TwitterScraperActor
+
+from neurons.miners._repo_import import ensure_repo_root_on_path
+from neurons.miners.worker_pool import X_SEARCH_KIND
+
+
+def _dendrite_hotkey(synapse) -> str | None:
+    d = getattr(synapse, "dendrite", None)
+    return getattr(d, "hotkey", None) if d else None
 
 
 class TwitterSearchMiner:
     def __init__(self, miner: any):
         self.miner = miner
-        self.twitter_scraper_actor = TwitterScraperActor()
+
+    def _ctx(self, hk: str | None):
+        uid = (
+            self.miner.validator_uid_for_hotkey(hk)
+            if hasattr(self.miner, "validator_uid_for_hotkey")
+            else None
+        )
+        gate = getattr(self.miner, "concurrency_gate", None)
+        return hk, uid, gate
 
     async def search(self, synapse: TwitterSearchSynapse):
-        # Extract the query parameters from the synapse
-        query = synapse.query
-        search_params = {
-            "sort": synapse.sort,
-            "start": synapse.start_date,
-            "end": synapse.end_date,
-            "tweetLanguage": synapse.lang,
-            "onlyVerifiedUsers": synapse.verified,
-            "onlyTwitterBlue": synapse.blue_verified,
-            "onlyQuote": synapse.is_quote,
-            "onlyVideo": synapse.is_video,
-            "onlyImage": synapse.is_image,
-            "minimumRetweets": synapse.min_retweets,
-            "minimumReplies": synapse.min_replies,
-            "minimumFavorites": synapse.min_likes,
-            "author": synapse.user,
-            "maxItems": synapse.count,
-        }
+        ensure_repo_root_on_path()
+        from db.miner_request_log import safe_log_miner_request
+        from solutions.twitter.query import search as solution_search
 
-        # Log query and search parameters
-        bt.logging.info(
-            f"Executing apify search with query: {query} and params: {search_params}"
-        )
+        bt.logging.info(f"Executing Twex solutions search with query: {synapse.query}")
+        hk, uid, gate = self._ctx(_dendrite_hotkey(synapse))
+        t0 = time.perf_counter()
 
-        tweets = await self.twitter_scraper_actor.get_tweets_advanced(
-            **search_params, searchTerms=[synapse.query]
-        )
+        async def _body():
+            try:
+                synapse.results = await solution_search(synapse)
+                safe_log_miner_request(
+                    "x_search",
+                    request_payload={
+                        "kind": "twitter_search",
+                        "query": synapse.query,
+                        "count": getattr(synapse, "count", None),
+                        "results_count": len(synapse.results or []),
+                    },
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    dendrite_hotkey=hk,
+                    validator_uid=uid,
+                )
+                bt.logging.info(
+                    f"Twitter search results count: {len(synapse.results or [])}"
+                )
+                return synapse
+            except Exception as e:
+                safe_log_miner_request(
+                    "x_search",
+                    request_payload={
+                        "kind": "twitter_search",
+                        "query": getattr(synapse, "query", ""),
+                    },
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    exc=e,
+                    dendrite_hotkey=hk,
+                    validator_uid=uid,
+                )
+                raise
 
-        synapse.results = [tweet.model_dump() for tweet in tweets]
-
-        bt.logging.info(f"Here is the final synapse: {synapse}")
-        return synapse
+        if gate:
+            async with gate.acquire(X_SEARCH_KIND, hk):
+                return await _body()
+        return await _body()
 
     async def search_by_id(self, synapse: TwitterIDSearchSynapse):
-        """
-        Perform a Twitter search based on a specific tweet ID.
-        """
-        tweet_id = synapse.id
+        ensure_repo_root_on_path()
+        from db.miner_request_log import safe_log_miner_request
+        from solutions.twitter.id import search_by_id as solution_by_id
 
-        # Log the search operation
-        bt.logging.info(f"Searching for tweet by ID: {tweet_id}")
+        bt.logging.info(f"Searching for tweet by ID: {synapse.id}")
+        hk, uid, gate = self._ctx(_dendrite_hotkey(synapse))
+        t0 = time.perf_counter()
 
-        url = [f"https://x.com/twitter/status/{tweet_id}"]
+        async def _body():
+            try:
+                synapse.results = await solution_by_id(synapse)
+                safe_log_miner_request(
+                    "x_search",
+                    request_payload={
+                        "kind": "twitter_id",
+                        "id": synapse.id,
+                        "results_count": len(synapse.results or []),
+                    },
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    dendrite_hotkey=hk,
+                    validator_uid=uid,
+                )
+                return synapse
+            except Exception as e:
+                safe_log_miner_request(
+                    "x_search",
+                    request_payload={
+                        "kind": "twitter_id",
+                        "id": getattr(synapse, "id", None),
+                    },
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    exc=e,
+                    dendrite_hotkey=hk,
+                    validator_uid=uid,
+                )
+                raise
 
-        tweets = await self.twitter_scraper_actor.get_tweets(urls=url)
-
-        synapse.results = [tweet.model_dump() for tweet in tweets]
-
-        return synapse
+        if gate:
+            async with gate.acquire(X_SEARCH_KIND, hk):
+                return await _body()
+        return await _body()
 
     async def search_by_urls(self, synapse: TwitterURLsSearchSynapse):
-        """
-        Perform a Twitter search based on multiple tweet URLs.
+        ensure_repo_root_on_path()
+        from db.miner_request_log import safe_log_miner_request
+        from solutions.twitter.url import search_by_urls as solution_by_urls
 
-        Parameters:
-            synapse (TwitterURLsSearchSynapse): Contains the list of tweet URLs.
+        bt.logging.info(f"Searching for tweets by URLs: {synapse.urls}")
+        hk, uid, gate = self._ctx(_dendrite_hotkey(synapse))
+        t0 = time.perf_counter()
 
-        Returns:
-            TwitterURLsSearchSynapse: The synapse with fetched tweets in the results field.
-        """
-        urls = synapse.urls
+        async def _body():
+            try:
+                synapse.results = await solution_by_urls(synapse)
+                safe_log_miner_request(
+                    "x_search",
+                    request_payload={
+                        "kind": "twitter_urls",
+                        "urls": list(synapse.urls or []),
+                        "results_count": len(synapse.results or []),
+                    },
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    dendrite_hotkey=hk,
+                    validator_uid=uid,
+                )
+                return synapse
+            except Exception as e:
+                safe_log_miner_request(
+                    "x_search",
+                    request_payload={
+                        "kind": "twitter_urls",
+                        "urls": list(getattr(synapse, "urls", None) or []),
+                    },
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    exc=e,
+                    dendrite_hotkey=hk,
+                    validator_uid=uid,
+                )
+                raise
 
-        # Log the search operation
-        bt.logging.info(f"Searching for tweets by URLs: {urls}")
-
-        tweets = await self.twitter_scraper_actor.get_tweets(urls)
-
-        synapse.results = [tweet.model_dump() for tweet in tweets]
-
-        return synapse
+        if gate:
+            async with gate.acquire(X_SEARCH_KIND, hk):
+                return await _body()
+        return await _body()

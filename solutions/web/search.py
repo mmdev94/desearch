@@ -3,10 +3,10 @@ Serper.dev Google web search for miners (drop-in for ``WebSearchMiner``).
 
 - Same synapse I/O as ``WebSearchMiner.search``: reads ``query``, ``start``, ``num``;
   fills ``synapse.results`` with ``WebSearchResult`` dicts.
-- Credits: each API key defaults to ``CREDITS_INITIAL`` (2460) when no count is stored.
-  Each successful Serper HTTP response decrements the chosen key by 1 (multiple pages
-  cost multiple credits). ``serper/api-keys.txt`` is rewritten with ``KEY<TAB>credits``
-  for every known key after a search that performed at least one HTTP call.
+- Credits: stored in Postgres table ``public.serper_api_key`` (columns ``api_key``, ``credits``)
+  when ``DATABASE_URL`` is set and the table has at least one row; otherwise falls back to
+  ``serper/api-keys.txt`` (``KEY<TAB>credits``). Each successful Serper HTTP response
+  decrements the chosen key by 1 (multiple pages cost multiple credits).
 - Validates like desearch basics: dedupe by link, then the same
   ``desearch.utils.is_valid_web_search_result`` used in
   ``WebBasicSearchContentRelevanceModel.check_response_random_link`` (second gate after
@@ -73,7 +73,45 @@ _FILE_HEADER = (
     "# Managed by solutions/web/search.py (credits decrease by number of Serper HTTP calls).\n"
 )
 
-_file_lock = threading.Lock()
+_serper_storage_lock = threading.Lock()
+
+
+def _ensure_repo_root_on_path() -> None:
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+
+
+def _load_keys_db() -> list[tuple[str, int]] | None:
+    """Load keys from Postgres if ``DATABASE_URL`` is set and ``db.serper`` works."""
+    if not (os.environ.get("DATABASE_URL") or "").strip():
+        return None
+    try:
+        _ensure_repo_root_on_path()
+        from db.serper import fetch_all_keys  # noqa: E402
+
+        keys = fetch_all_keys()
+        return keys if keys else None
+    except Exception:
+        return None
+
+
+def _debit_db(api_key: str, debit: int) -> None:
+    _ensure_repo_root_on_path()
+    from db.serper import debit_credits  # noqa: E402
+
+    debit_credits(api_key, debit)
+
+
+def _load_keys_for_search(keys_path: Path) -> tuple[list[tuple[str, int]], str]:
+    """
+    Returns (keys, storage) where storage is ``\"db\"`` or ``\"file\"``.
+    Prefer DB when configured and non-empty; otherwise text file.
+    """
+    db_keys = _load_keys_db()
+    if db_keys is not None:
+        return db_keys, "db"
+    keys = _load_keys(keys_path)
+    return keys, "file"
 
 
 def _normalize_link(url: str) -> str:
@@ -255,7 +293,8 @@ def _validate_and_dedupe(
 
 class SerperWebSearch:
     """
-    Google search via Serper with per-key credit tracking on ``api-keys.txt``.
+    Google search via Serper with per-key credit tracking (Postgres ``serper_api_key`` or
+    ``serper/api-keys.txt``).
 
     Usage (same shape as ``WebSearchMiner``)::
 
@@ -326,13 +365,18 @@ class SerperWebSearch:
         need_end = start + num
         raw_target = max(need_end, int(math.ceil(need_end * self.fetch_multiplier)))
 
-        with _file_lock:
-            keys = _load_keys(self.keys_path)
+        with _serper_storage_lock:
+            keys, storage = _load_keys_for_search(self.keys_path)
             idx = _pick_key(keys)
             if idx < 0 or keys[idx][1] <= 0:
+                hint = (
+                    "public.serper_api_key (DATABASE_URL)"
+                    if storage == "db"
+                    else str(self.keys_path)
+                )
                 raise RuntimeError(
                     "No Serper API key with remaining credits. "
-                    f"Add keys or top up in {self.keys_path}"
+                    f"Add keys or top up credits in {hint}"
                 )
             api_key = keys[idx][0]
 
@@ -399,9 +443,12 @@ class SerperWebSearch:
         )
 
         if http_hits > 0:
-            with _file_lock:
-                keys2 = _load_keys(self.keys_path)
-                self._adjust_credits_for_key(api_key, keys2, http_hits)
+            with _serper_storage_lock:
+                if storage == "db":
+                    _debit_db(api_key, http_hits)
+                else:
+                    keys2 = _load_keys(self.keys_path)
+                    self._adjust_credits_for_key(api_key, keys2, http_hits)
 
         return synapse
 

@@ -3,8 +3,9 @@
 Reset DB schema for automation account storage.
 
 Behavior:
-- Drops all tables in ``public`` except ``apify_account`` and ``twex_account``.
-- Creates/ensures both tables and related indexes (idempotent).
+- Drops all tables in ``public`` except ``apify_account``, ``twex_account``, ``serper_api_key``,
+  and the three miner request log tables (see below).
+- Creates/ensures account tables, Serper keys, and miner request log tables (idempotent).
 
 ``apify_account`` and ``twex_account`` both hold automation fields:
 email, password, API key/token and credit amount, with unique lower(email).
@@ -40,7 +41,14 @@ BEGIN
     SELECT tablename
     FROM pg_tables
     WHERE schemaname = 'public'
-      AND tablename NOT IN ('apify_account', 'twex_account')
+      AND tablename NOT IN (
+        'apify_account',
+        'twex_account',
+        'serper_api_key',
+        'miner_request_log_x_search',
+        'miner_request_log_web_search',
+        'miner_request_log_ai_search'
+      )
   LOOP
     EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', r.tablename);
   END LOOP;
@@ -77,6 +85,50 @@ CREATE TABLE IF NOT EXISTS public.twex_account (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_twex_account_email_lower
   ON public.twex_account (lower(trim(email)));
 """
+
+CREATE_SERPER_API_KEY_SQL = """
+CREATE TABLE IF NOT EXISTS public.serper_api_key (
+    api_key TEXT PRIMARY KEY,
+    credits INTEGER NOT NULL DEFAULT 2460 CHECK (credits >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_serper_api_key_credits ON public.serper_api_key (credits DESC);
+"""
+
+# Three logically separate request logs (one table per search type / synapse family).
+_CREATE_MINER_LOG_TEMPLATE = """
+CREATE TABLE IF NOT EXISTS public.{name} (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    dendrite_hotkey TEXT,
+    validator_uid INTEGER,
+    result_status TEXT NOT NULL DEFAULT 'unknown',
+    status TEXT NOT NULL DEFAULT 'ok',
+    error TEXT,
+    duration_ms DOUBLE PRECISION,
+    request_json JSONB NOT NULL DEFAULT '{{}}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_{name}_created_at ON public.{name} (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{name}_hotkey ON public.{name} (dendrite_hotkey);
+CREATE INDEX IF NOT EXISTS idx_{name}_uid ON public.{name} (validator_uid);
+CREATE INDEX IF NOT EXISTS idx_{name}_result ON public.{name} (result_status);
+"""
+
+_MINER_LOG_UPGRADE_SQL = (
+    "ALTER TABLE public.miner_request_log_x_search ADD COLUMN IF NOT EXISTS validator_uid INTEGER",
+    "ALTER TABLE public.miner_request_log_x_search ADD COLUMN IF NOT EXISTS result_status TEXT NOT NULL DEFAULT 'unknown'",
+    "ALTER TABLE public.miner_request_log_web_search ADD COLUMN IF NOT EXISTS validator_uid INTEGER",
+    "ALTER TABLE public.miner_request_log_web_search ADD COLUMN IF NOT EXISTS result_status TEXT NOT NULL DEFAULT 'unknown'",
+    "ALTER TABLE public.miner_request_log_ai_search ADD COLUMN IF NOT EXISTS validator_uid INTEGER",
+    "ALTER TABLE public.miner_request_log_ai_search ADD COLUMN IF NOT EXISTS result_status TEXT NOT NULL DEFAULT 'unknown'",
+)
+
+CREATE_MINER_REQUEST_LOGS_SQL = "\n".join(
+    [
+        _CREATE_MINER_LOG_TEMPLATE.format(name="miner_request_log_x_search"),
+        _CREATE_MINER_LOG_TEMPLATE.format(name="miner_request_log_web_search"),
+        _CREATE_MINER_LOG_TEMPLATE.format(name="miner_request_log_ai_search"),
+    ]
+)
 
 _APIFY_ACCOUNT_UPGRADE_SQL = (
     "ALTER TABLE public.apify_account ADD COLUMN IF NOT EXISTS api_token TEXT",
@@ -130,6 +182,10 @@ def main() -> int:
             cur.execute(DROP_OTHER_PUBLIC_TABLES_SQL)
             cur.execute(CREATE_APIFY_ACCOUNT_SQL)
             cur.execute(CREATE_TWEX_ACCOUNT_SQL)
+            cur.execute(CREATE_SERPER_API_KEY_SQL)
+            cur.execute(CREATE_MINER_REQUEST_LOGS_SQL)
+            for stmt in _MINER_LOG_UPGRADE_SQL:
+                cur.execute(stmt)
             for stmt in _APIFY_ACCOUNT_UPGRADE_SQL:
                 cur.execute(stmt)
             for stmt in _TWEX_ACCOUNT_UPGRADE_SQL:
@@ -142,8 +198,8 @@ def main() -> int:
             )
         conn.commit()
         print(
-            "DB reset complete: apify_account + twex_account are ready "
-            "(other public tables dropped)."
+            "DB reset complete: apify_account + twex_account + serper_api_key + "
+            "miner request logs are ready (other public tables dropped)."
         )
     finally:
         conn.close()

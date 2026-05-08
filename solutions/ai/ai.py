@@ -31,6 +31,11 @@ from solutions.ai.youtube_search_pkg import run_youtube_search_sync
 from solutions.twitter.query import search as twitter_search
 from solutions.web.search import run_web_search
 
+try:
+    from neurons.validators.utils.prompts import SearchSummaryRelevancePrompt
+except ImportError:
+    SearchSummaryRelevancePrompt = None  # type: ignore[misc, assignment]
+
 _QUERY_MODEL = "gpt-4.1-nano"
 _SUMMARY_MODEL = "gpt-4.1-nano"
 
@@ -317,6 +322,199 @@ def _expand_bracket_ids_to_markdown_links(
         return m.group(0)
 
     return re.sub(r"\[(\d+)\](?!\()", repl, text)
+
+
+# If neurons.validators is not on PYTHONPATH, mirror prompts.py system_message_question_answer_template.
+_FALLBACK_SEARCH_RELEVANCE_SYSTEM = """
+Relevance Scoring Guide:
+
+Role: As an evaluator, your task is to determine how well a web link answers a specific question based on the presence of keywords and the depth of content.
+
+Scoring Criteria:
+
+Score 2:
+- Criteria: Content does not mention the question's keywords/themes.
+- Example:
+  - Question: "Effects of global warming on polar bears?"
+  - Content: "Visit the best tropical beaches!"
+  - Output: Score 2, Explanation: No mention of global warming or polar bears.
+
+Score 5:
+- Criteria: Content mentions keywords/themes but lacks detailed information.
+- Example:
+  - Question: "AI in healthcare?"
+  - Content: "AI is transforming industries."
+  - Output: Score 5, Explanation: Mentions AI but not healthcare.
+
+Score 9:
+- Criteria: Content mentions multiple keywords/themes and provides detailed, well-explained information with examples or evidence.
+- Example:
+  - Question: "Latest trends in renewable energy?"
+  - Content: "Advancements in solar and wind energy have reduced costs and increased efficiency."
+  - Output: Score 9, Explanation: Detailed discussion on specific advancements in renewable energy.
+
+Important Rules:
+1. Identify Keywords: Extract keywords/themes from the question.
+2. Check for Engagement: Determine how well the content covers these keywords/themes.
+3. Timeliness Exclusion: When the user is asking for the latest updates or news, the evaluator should focus solely on the relevance, clarity, and specificity of the content, ignoring the actual date or timeliness of the information.
+4. Scoring:
+   - 2: No relevant keywords.
+   - 5: Superficial mention.
+   - 9: Detailed, well-explained information with examples or evidence.
+
+Output Format:
+Score: [2, 5, or 9], Explanation:
+"""
+
+
+def _search_relevance_system_message() -> str:
+    if SearchSummaryRelevancePrompt is not None:
+        return SearchSummaryRelevancePrompt().get_system_message()
+    return _FALLBACK_SEARCH_RELEVANCE_SYSTEM.strip()
+
+
+def _snap_to_validator_score(x: float) -> float:
+    """Map any numeric to the nearest of 2, 5, 9 (validator buckets)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 5.0
+    return min((2.0, 5.0, 9.0), key=lambda c: abs(c - v))
+
+
+def _validator_score_to_relevance(score: float) -> ContextualRelevance:
+    s = _snap_to_validator_score(score)
+    if s == 2.0:
+        return ContextualRelevance.LOW
+    if s == 5.0:
+        return ContextualRelevance.MEDIUM
+    return ContextualRelevance.HIGH
+
+
+def _format_batch_label_user_content(
+    task_question: str, sources: list[UnifiedSource]
+) -> str:
+    """Batched Title+Description per source; same Question for all (validator-style)."""
+    lines = [
+        "For EACH numbered source, assign one relevance score: 2, 5, or 9 (see system guide).",
+        "Return JSON only: {\"scores\":[{\"index\":1,\"score\":5},...]} with exactly one object per source index.",
+        "",
+        f"Question:\n{task_question.strip()[:2000]}",
+        "",
+        "Sources (Title + Description = title + snippet):",
+    ]
+    for i, s in enumerate(sources, 1):
+        title = (s.title or "").replace("\n", " ").strip()
+        desc = _snippet_for_prompt(s.snippet or title, 800)
+        lines.append(f"{i}. Title: {title}")
+        lines.append(f"   Description: {desc}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+async def _run_compact_summary_llm(
+    client: AsyncOpenAI,
+    query: str,
+    llm_sources: list[UnifiedSource],
+) -> str:
+    """Single JSON summary; same model as labels; runs in parallel with label worker."""
+    n_llm = len(llm_sources)
+    max_words = 280
+    system = (
+        f"The user lists {n_llm} sources (title + snippet only). URLs are omitted on purpose. "
+        "Write a quick, shallow markdown answer — not a deep analysis. "
+        "Use **bold** section headers only (no #). End with **Conclusion**. "
+        f"About {max_words} words max. No **Sources** section.\n"
+        "Cite evidence using ONLY bracket source ids [1], [2], … matching the numbered list below "
+        "(source 1 = first block). Do not paste real URLs; use [n] only.\n"
+        "Return JSON only: {\"summary\":\"...\"}"
+    )
+    user = _format_compact_summary_user_content(query, llm_sources)
+    _log_summary_llm_full_prompt(system, user)
+    try:
+        resp = await client.chat.completions.create(
+            model=_SUMMARY_MODEL,
+            temperature=0.15,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            timeout=2.8,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = json.loads(raw or "{}")
+        text = str(parsed.get("summary") or "").replace("\\n", "\n").strip()
+        if not text:
+            text = _build_fast_cited_summary(query, llm_sources)
+        text = _expand_bracket_ids_to_markdown_links(text, llm_sources)
+        text = _ensure_summary_structure(text)
+        distinct_before = len(_distinct_source_indices_cited(text, n_llm))
+        text, used_full_cite = _ensure_minimum_source_citations(text, query, llm_sources)
+        if used_full_cite:
+            text = _expand_bracket_ids_to_markdown_links(text, llm_sources)
+            _log(
+                "summary_enforced_full_citations=1 "
+                f"distinct_indices_before_enforcement={distinct_before}"
+            )
+        if not _contains_markdown_links(text):
+            text = _ensure_summary_structure(_build_fast_cited_summary(query, llm_sources))
+        return text
+    except Exception as e:
+        _log(f"summary_llm_branch_error={type(e).__name__}: {e}")
+        return _ensure_summary_structure(_build_fast_cited_summary(query, llm_sources))
+
+
+async def _run_link_labels_llm(
+    client: AsyncOpenAI,
+    query: str,
+    all_sources: list[UnifiedSource],
+) -> dict[str, ContextualRelevance]:
+    """
+    Second LLM call: desearch SearchSummaryRelevance system prompt; batched 2/5/9 for miner_link_scores.
+    """
+    if not all_sources:
+        return {}
+    system = _search_relevance_system_message()
+    user = _format_batch_label_user_content(query, all_sources)
+    _log("summary_llm_labels_USER<<<BEGIN>>>")
+    _log(user)
+    _log("summary_llm_labels_USER<<<END>>>")
+    try:
+        resp = await client.chat.completions.create(
+            model=_SUMMARY_MODEL,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            timeout=4.0,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = json.loads(raw or "{}")
+        rows = parsed.get("scores") or parsed.get("evaluations") or []
+        out: dict[str, ContextualRelevance] = {}
+        for row in rows:
+            try:
+                idx = int(row.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if idx < 1 or idx > len(all_sources):
+                continue
+            src = all_sources[idx - 1]
+            key = (src.score_key or src.link).strip()
+            if not key:
+                continue
+            sc = row.get("score")
+            if sc is None and row.get("validator_score") is not None:
+                sc = row.get("validator_score")
+            try:
+                out[key] = _validator_score_to_relevance(float(sc))
+            except (TypeError, ValueError):
+                continue
+        for s in all_sources:
+            key = (s.score_key or s.link).strip()
+            if key and key not in out:
+                out[key] = ContextualRelevance.MEDIUM
+        return out
+    except Exception as e:
+        _log(f"labels_llm_branch_error={type(e).__name__}: {e}")
+        return _miner_link_scores_raw_keywords(query, all_sources)
 
 
 def _ensure_minimum_source_citations(
@@ -758,56 +956,21 @@ async def _build_summary_from_selected(
             "**Conclusion**\nThe query needs broader terms or updated data.",
             {},
         )
-    miner_scores = _miner_link_scores_raw_keywords(query, summary_sources)
     llm_sources = summary_sources[:_SUMMARY_LLM_SOURCE_COUNT]
-    n_llm = len(llm_sources)
-
     client = _openai_client()
-    max_words = 280
-    system = (
-        f"The user lists {n_llm} sources (title + snippet only). URLs are omitted on purpose. "
-        "Write a quick, shallow markdown answer — not a deep analysis. "
-        "Use **bold** section headers only (no #). End with **Conclusion**. "
-        f"About {max_words} words max. No **Sources** section.\n"
-        "Cite evidence using ONLY bracket source ids [1], [2], … matching the numbered list below "
-        "(source 1 = first block). Do not paste real URLs; use [n] only.\n"
-        "Return JSON only: {\"summary\":\"...\"}"
-    )
-    user = _format_compact_summary_user_content(query, llm_sources)
-    _log_summary_llm_full_prompt(system, user)
+    t_parallel = time.perf_counter()
     try:
-        resp = await client.chat.completions.create(
-            model=_SUMMARY_MODEL,
-            temperature=0.15,
-            response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            timeout=2.8,
+        summary_text, miner_scores = await asyncio.gather(
+            _run_compact_summary_llm(client, query, llm_sources),
+            _run_link_labels_llm(client, query, summary_sources),
         )
-        raw = (resp.choices[0].message.content or "").strip()
-        parsed = json.loads(raw or "{}")
-        text = str(parsed.get("summary") or "").replace("\\n", "\n").strip()
-        if not text:
-            text = _build_fast_cited_summary(query, llm_sources)
-        text = _expand_bracket_ids_to_markdown_links(text, llm_sources)
-        text = _ensure_summary_structure(text)
-        distinct_before = len(_distinct_source_indices_cited(text, n_llm))
-        text, used_full_cite = _ensure_minimum_source_citations(
-            text, query, llm_sources
-        )
-        if used_full_cite:
-            text = _expand_bracket_ids_to_markdown_links(text, llm_sources)
-            _log(
-                "summary_enforced_full_citations=1 "
-                f"distinct_indices_before_enforcement={distinct_before}"
-            )
-        if not _contains_markdown_links(text):
-            text = _ensure_summary_structure(_build_fast_cited_summary(query, llm_sources))
-        return text, miner_scores
     except Exception:
-        return (
-            _ensure_summary_structure(_build_fast_cited_summary(query, llm_sources)),
-            _miner_link_scores_raw_keywords(query, summary_sources),
+        summary_text = _ensure_summary_structure(
+            _build_fast_cited_summary(query, llm_sources)
         )
+        miner_scores = _miner_link_scores_raw_keywords(query, summary_sources)
+    _log(f"timing.parallel_summary_and_labels={time.perf_counter() - t_parallel:.3f}s")
+    return summary_text, miner_scores
 
 
 async def run_ai_solution(

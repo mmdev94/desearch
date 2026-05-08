@@ -1,7 +1,7 @@
 {
   "concurrency": {
-    "web_search": 1,
-    "x_search": 1,
-    "ai_search": 1
+    "web_search": 100,
+    "x_search": 100,
+    "ai_search": 100
   }
 }

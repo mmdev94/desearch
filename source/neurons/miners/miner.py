@@ -31,6 +31,7 @@ from neurons.miners.config import check_config, get_config
 from neurons.miners.scraper_miner import ScraperMiner
 from neurons.miners.twitter_search_miner import TwitterSearchMiner
 from neurons.miners.web_search_miner import WebSearchMiner
+from neurons.miners.worker_pool import PerValidatorConcurrencyGate
 
 RATE_LIMIT_WINDOW_MINUTES = 1
 RATE_LIMIT_MAX_REQUESTS = 500
@@ -53,6 +54,7 @@ class StreamMiner(ABC):
 
         self.request_timestamps: Dict = {}
         self.manifest = load_miner_manifest(self.config.miner.config_path)
+        self.concurrency_gate = PerValidatorConcurrencyGate(lambda: self.manifest)
 
         bt.logging(config=self.config, logging_dir=self.config.full_path)
         bt.logging.on()
@@ -72,6 +74,21 @@ class StreamMiner(ABC):
         self.my_subnet_uid: int | None = None
         self.last_epoch_block: int | None = None
         self.lock = asyncio.Lock()
+
+    def validator_uid_for_hotkey(self, hotkey: str | None) -> int | None:
+        """Subnet UID for a dendrite hotkey when registered on the current metagraph."""
+        if not hotkey:
+            return None
+        mg = getattr(self, "metagraph", None)
+        if mg is None:
+            return None
+        try:
+            for uid, axon in enumerate(mg.axons):
+                if getattr(axon, "hotkey", None) == hotkey:
+                    return int(uid)
+        except Exception:
+            return None
+        return None
 
     async def initialize(self):
         self.subtensor = bt.AsyncSubtensor(
