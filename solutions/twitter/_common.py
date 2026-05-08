@@ -258,10 +258,26 @@ def _normalize_api_payload_to_items(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
 
+    def _unwrap_rows(rows: list[Any]) -> list[dict[str, Any]]:
+        """
+        Normalize provider row wrappers into tweet nodes.
+        TweetAPI may return rows like {"type":"tweet","content":{...tweet...}}.
+        """
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            content = row.get("content")
+            if isinstance(content, dict):
+                out.append(content)
+            else:
+                out.append(row)
+        return out
+
     # Common API envelope
     data = payload.get("data")
     if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
+        return _unwrap_rows(data)
 
     # GraphQL-style search responses often carry entries and tweet_results.
     nodes = list(_iter_tweet_nodes(payload))
@@ -273,7 +289,7 @@ def _normalize_api_payload_to_items(payload: Any) -> list[dict[str, Any]]:
         for key in ("tweets", "items", "results"):
             v = data.get(key)
             if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
+                return _unwrap_rows(v)
     return []
 
 
@@ -841,7 +857,8 @@ async def run_actor_to_result_dicts(actor_id: str, run_input: dict) -> list[dict
     target_count = max(1, _to_int(run_input.get("maxItems"), default=20))
 
     query_candidates: list[str] = [query]
-    if not _is_simple_direct_query(raw_query):
+    skip_llm_planner = bool(run_input.get("skip_llm_planner"))
+    if (not skip_llm_planner) and (not _is_simple_direct_query(raw_query)):
         llm_queries = await _llm_generate_queries(raw_query)
         if llm_queries:
             # Use only one best LLM-generated query for complex prompts.

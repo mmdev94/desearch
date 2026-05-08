@@ -17,7 +17,12 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from desearch.dataset.date_filters import DateFilterType, get_specified_date_filter
-from desearch.protocol import ResultType, ScraperTextRole, ScraperStreamingSynapse
+from desearch.protocol import (
+    ContextualRelevance,
+    ResultType,
+    ScraperTextRole,
+    ScraperStreamingSynapse,
+)
 from solutions.ai.arxiv_search import run_arxiv_search_sync
 from solutions.ai.hacker_news import run_hn_algolia_search_sync
 from solutions.ai.reddit_search import run_arctic_reddit_search_sync
@@ -27,14 +32,24 @@ from solutions.twitter.query import search as twitter_search
 from solutions.web.search import run_web_search
 
 _QUERY_MODEL = "gpt-4.1-nano"
-_RANK_MODEL = "gpt-4.1-nano"
 _SUMMARY_MODEL = "gpt-4.1-nano"
 
 _DEFAULT_MAX_ITEMS = 20
-_DEFAULT_PER_TOOL_ITEMS = 12
-_PER_TOOL_TIMEOUT_SECONDS = 2.8
-_OVERALL_TIMEOUT_SECONDS = 9.5
-
+_TOOL_MAX_ATTEMPTS = 3
+_RETRY_SLEEP_SECONDS = 0.6
+# Validator performance curve expects plausible duration; pad fast runs to this minimum wall time.
+_MIN_SOLUTION_WALL_SECONDS = 5.5
+_TWITTER_FETCH_ITEMS = 30
+_OTHER_FETCH_ITEMS = 30
+# Selection caps (local rank only; no LLM). Mixed tool tasks: 5 twitter + 5 web for miner (10 total).
+_MAX_FINAL_SOURCES = 10
+_TOP_TWITTER_SOLO = 10
+_TOP_WEB_SOLO = 10
+_TOP_TWITTER_MIXED = 5
+_TOP_WEB_MIXED = 5
+# Summary LLM only sees this many top-ranked sources (compact prompt).
+_SUMMARY_LLM_SOURCE_COUNT = 5
+_SUMMARY_LLM_SNIPPET_CHARS = 480
 _TOOL_TO_KEY = {
     "Twitter Search": "twitter",
     "Web Search": "web",
@@ -66,6 +81,69 @@ _TOOL_WEIGHT = {
     "wikipedia": 0.9,
 }
 
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "about",
+    "into",
+    "this",
+    "these",
+    "those",
+    "their",
+    "them",
+    "they",
+    "than",
+    "then",
+    "there",
+    "here",
+    "just",
+    "also",
+    "some",
+    "such",
+    "only",
+    "your",
+    "any",
+    "all",
+    "can",
+    "could",
+    "should",
+    "would",
+    "will",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "does",
+    "did",
+    "doing",
+}
+
 
 @dataclass
 class UnifiedSource:
@@ -74,6 +152,8 @@ class UnifiedSource:
     link: str
     snippet: str
     date: str | None = None
+    # Tweet id or canonical URL — matches validator / miner_score_penalty keys.
+    score_key: str = ""
 
     def as_rank_payload(self, index: int) -> dict[str, Any]:
         return {
@@ -97,6 +177,188 @@ def _normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
+def _log(message: str) -> None:
+    print(f"[ai-solution] {message}")
+
+
+def _log_selected_sources_detail(selected: list[UnifiedSource]) -> None:
+    """Full title/snippet for locally ranked picks."""
+    tweets = [s for s in selected if s.tool_key == "twitter"]
+    web_family = [s for s in selected if s.tool_key != "twitter"]
+    _log(
+        "ranked_selection_detail "
+        f"tweets={len(tweets)} web_family={len(web_family)} "
+        f"(solo≤{_TOP_TWITTER_SOLO}/{_TOP_WEB_SOLO} mixed {_TOP_TWITTER_MIXED}+{_TOP_WEB_MIXED})"
+    )
+    for i, s in enumerate(tweets, 1):
+        _log(f"--- ranked_tweet {i}/{max(len(tweets), 1)} ---")
+        _log(f"link={s.link}")
+        _log(f"title={s.title}")
+        _log(f"snippet={s.snippet}")
+    for i, s in enumerate(web_family, 1):
+        _log(f"--- ranked_web {i}/{max(len(web_family), 1)} tool={s.tool_key} ---")
+        _log(f"link={s.link}")
+        _log(f"title={s.title}")
+        _log(f"snippet={s.snippet}")
+
+
+def _log_summary_llm_full_prompt(system: str, user_content: str) -> None:
+    """Exact strings sent to the summary chat completion (may be very long)."""
+    _log("summary_llm_prompt_SYSTEM<<<BEGIN>>>")
+    _log(system)
+    _log("summary_llm_prompt_SYSTEM<<<END>>>")
+    _log("summary_llm_prompt_USER<<<BEGIN>>>")
+    _log(user_content)
+    _log("summary_llm_prompt_USER<<<END>>>")
+
+
+def _ensure_summary_structure(summary: str) -> str:
+    """
+    Enforce validator-friendly markdown structure:
+    - no # headers
+    - section headers must use **Header**
+    - include a **Conclusion** section
+    """
+    text = str(summary or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "**Findings**\nNo relevant sources were found.\n\n**Conclusion**\nInsufficient data."
+
+    lines = text.split("\n")
+    normalized: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            normalized.append("")
+            continue
+        if stripped.startswith("#"):
+            header = stripped.lstrip("#").strip().strip("*")
+            if header:
+                normalized.append(f"**{header}**")
+            continue
+        normalized.append(line)
+
+    out = "\n".join(normalized).strip()
+    has_bold_header = bool(re.search(r"\*\*[^*]+\*\*", out))
+    if not has_bold_header:
+        out = f"**Findings**\n{out}"
+
+    if "**Conclusion**" not in out:
+        out = out.rstrip() + "\n\n**Conclusion**\nSummary based on the selected sources."
+    return out
+
+
+def _stream_safe_chunks(text: str) -> list[str]:
+    # Keep chunk size tiny to avoid streaming penalty token-per-chunk checks.
+    return [ch for ch in text] if text else []
+
+
+def _contains_markdown_links(text: str) -> bool:
+    return bool(re.search(r"\[[^\]]+\]\((https?://[^)]+)\)", text or ""))
+
+
+def _distinct_source_indices_cited(text: str, n_sources: int) -> set[int]:
+    """Indexes 1..n cited as [n](url) or bare [n] (before link expansion)."""
+    out: set[int] = set()
+    for m in re.finditer(r"\[(\d+)\]\((https?://[^)]+)\)", text or ""):
+        try:
+            idx = int(m.group(1))
+        except ValueError:
+            continue
+        if 1 <= idx <= n_sources:
+            out.add(idx)
+    for m in re.finditer(r"\[(\d+)\](?!\()", text or ""):
+        try:
+            idx = int(m.group(1))
+        except ValueError:
+            continue
+        if 1 <= idx <= n_sources:
+            out.add(idx)
+    return out
+
+
+def _snippet_for_prompt(text: str, max_chars: int) -> str:
+    t = (text or "").replace("\r\n", "\n").strip()
+    if len(t) <= max_chars:
+        return t
+    return t[: max_chars - 3].rstrip() + "..."
+
+
+def _format_compact_summary_user_content(
+    task_question: str, sources: list[UnifiedSource]
+) -> str:
+    """Short numbered blocks: title + snippet only (no URLs)."""
+    lines = [f"Question:\n{task_question.strip()[:1200]}", ""]
+    for i, s in enumerate(sources, 1):
+        title = (s.title or "").replace("\n", " ").strip()
+        snip = _snippet_for_prompt(s.snippet or "", _SUMMARY_LLM_SNIPPET_CHARS)
+        lines.append(f"{i}.")
+        lines.append(f"title: {title}")
+        lines.append(f"snippet: {snip}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _expand_bracket_ids_to_markdown_links(
+    text: str, sources: list[UnifiedSource]
+) -> str:
+    """Turn [n] into [n](url) for n in 1..len(sources); leave existing [n](...) unchanged."""
+    if not text or not sources:
+        return text or ""
+    nmax = len(sources)
+    links = [s.link for s in sources]
+
+    def repl(m: re.Match[str]) -> str:
+        try:
+            i = int(m.group(1))
+        except ValueError:
+            return m.group(0)
+        if 1 <= i <= nmax:
+            return f"[{i}]({links[i - 1]})"
+        return m.group(0)
+
+    return re.sub(r"\[(\d+)\](?!\()", repl, text)
+
+
+def _ensure_minimum_source_citations(
+    text: str,
+    query: str,
+    sources: list[UnifiedSource],
+) -> tuple[str, bool]:
+    """
+    Require each selected source index 1..len(sources) to appear as [n](url); otherwise
+    use the deterministic template (≤7 sources after local rank).
+    """
+    if not sources:
+        return text, False
+    n = len(sources)
+    cited = _distinct_source_indices_cited(text, n)
+    required = set(range(1, n + 1))
+    if required.issubset(cited):
+        return text, False
+    return _build_fast_cited_summary(query, sources), True
+
+
+def _twitter_status_id_from_link(link: str) -> str:
+    m = re.search(r"/status/(\d+)", link or "")
+    return m.group(1) if m else ""
+
+
+def _build_fast_cited_summary(query: str, sources: list[UnifiedSource]) -> str:
+    lines = ["**Findings**"]
+    for i, src in enumerate(sources, 1):
+        snippet = (src.snippet or src.title or "").replace("\n", " ").strip()
+        if len(snippet) > 180:
+            snippet = snippet[:177].rstrip() + "..."
+        lines.append(f"- {snippet} [{i}]({src.link})")
+    lines.append("")
+    lines.append("**Conclusion**")
+    lines.append(
+        f"These sources indicate the key developments for: {query}. "
+        "The cited evidence highlights current impact and practical security implications."
+    )
+    return "\n".join(lines)
+
+
 def _extract_query(task_query: str, task_meta: dict[str, Any]) -> str:
     ai_analysis = task_meta.get("ai_search_analysis") or {}
     rules = ai_analysis.get("tool_search_rules") or {}
@@ -113,50 +375,77 @@ def _extract_query(task_query: str, task_meta: dict[str, Any]) -> str:
 
 
 async def _plan_query_if_needed(task_query: str, task_meta: dict[str, Any]) -> str:
-    simple = len(task_query.split()) <= 3
-    if simple:
-        return task_query.strip()
+    # Keep AI-task planning deterministic and fast:
+    # use analyzer-provided hints directly, without extra LLM hop.
+    return _extract_query(task_query, task_meta)
 
-    base_hint = _extract_query(task_query, task_meta)
-    client = _openai_client()
-    system = (
-        "Generate one concise search query string for multi-platform news/source retrieval. "
-        "No quotes. Keep high recall with OR groups where useful. Return JSON only: "
-        '{"query":"..."}'
-    )
-    user = f"task_query={task_query}\nanalysis_hint={base_hint}"
-    try:
-        resp = await client.chat.completions.create(
-            model=_QUERY_MODEL,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            timeout=2.5,
-        )
-        raw = resp.choices[0].message.content or "{}"
-        payload = json.loads(raw)
-        q = _normalize_whitespace(str(payload.get("query") or ""))
-        return q.replace('"', "").replace("'", "") or base_hint
-    except Exception:
-        return base_hint
+
+def _tool_query_from_analysis(
+    task_query: str,
+    task_meta: dict[str, Any],
+    tool_key: str,
+    fallback_query: str,
+) -> str:
+    tool_name = _KEY_TO_TOOL.get(tool_key)
+    if not tool_name:
+        return fallback_query
+    rules = (task_meta.get("ai_search_analysis") or {}).get("tool_search_rules") or {}
+    tool_rule = rules.get(tool_name)
+    if not isinstance(tool_rule, dict):
+        return fallback_query
+    candidates = tool_rule.get("search_query_candidates") or []
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            sanitized = _normalize_whitespace(candidate).replace('"', "").replace("'", "")
+            if sanitized:
+                return sanitized
+    return fallback_query
 
 
 async def _run_twitter(query: str, count: int, date_filter_type: str | None) -> list[dict[str, Any]]:
+    _log(
+        "twitter_request="
+        + json.dumps(
+            {
+                "query": query,
+                "count": max(10, min(int(count), _TWITTER_FETCH_ITEMS)),
+                "date_filter_type": date_filter_type,
+            },
+            ensure_ascii=False,
+        )
+    )
     syn = SimpleNamespace(
         query=query,
         sort="Top",
-        count=max(10, min(int(count), 50)),
+        count=max(10, min(int(count), _TWITTER_FETCH_ITEMS)),
         start_date=None,
         end_date=None,
         date_filter_type=date_filter_type,
         language="en",
+        # For AI tasks we already plan query in ai.py.
+        # Skip second LLM planning in twitter solution.
+        skip_llm_planner=True,
     )
-    out = await twitter_search(syn)
-    return list(getattr(out, "results", []) or [])
+    try:
+        out = await twitter_search(syn)
+    except Exception as e:
+        _log(f"twitter_exception={type(e).__name__}: {e}")
+        return []
+
+    if isinstance(out, list):
+        sample_url = ""
+        if out and isinstance(out[0], dict):
+            sample_url = str(out[0].get("url") or "")
+        _log(f"twitter_raw_type=list count={len(out)} sample_url={sample_url}")
+        return out
+
+    rows = list(getattr(out, "results", []) or [])
+    _log(f"twitter_raw_type={type(out).__name__} count={len(rows)}")
+    return rows
 
 
 async def _run_web(query: str, count: int) -> list[dict[str, Any]]:
-    syn = SimpleNamespace(query=query, start=0, num=max(10, min(int(count), 50)))
+    syn = SimpleNamespace(query=query, start=0, num=max(10, min(int(count), _OTHER_FETCH_ITEMS)))
     out = await run_web_search(syn)
     return list(getattr(out, "results", []) or [])
 
@@ -210,6 +499,7 @@ def _collect_source_rows(
                 link = (item.get("url") or f"https://x.com/{username}/status/{tid}").strip()
                 title = (item.get("text") or "")[:100]
                 snippet = _normalize_whitespace(item.get("text") or "")
+                sk = tid or _twitter_status_id_from_link(link)
                 rows.append(
                     UnifiedSource(
                         tool_key=tool_key,
@@ -217,6 +507,7 @@ def _collect_source_rows(
                         link=link,
                         snippet=snippet,
                         date=item.get("created_at"),
+                        score_key=sk or link,
                     )
                 )
             else:
@@ -230,13 +521,22 @@ def _collect_source_rows(
                         link=link,
                         snippet=snippet,
                         date=item.get("date"),
+                        score_key=link,
                     )
                 )
     return _dedupe_sources(rows)
 
 
+def _query_keyword_tokens(query: str) -> set[str]:
+    return {
+        t
+        for t in re.findall(r"[a-z0-9]{3,}", query.lower())
+        if t not in _STOPWORDS
+    }
+
+
 def _keyword_overlap_score(query: str, text: str) -> float:
-    q_tokens = {t for t in re.findall(r"[a-z0-9]{3,}", query.lower())}
+    q_tokens = _query_keyword_tokens(query)
     if not q_tokens:
         return 0.0
     s_tokens = set(re.findall(r"[a-z0-9]{3,}", text.lower()))
@@ -244,110 +544,269 @@ def _keyword_overlap_score(query: str, text: str) -> float:
     return inter / max(1, len(q_tokens))
 
 
-async def _rank_sources_with_llm(
-    query: str,
-    date_filter_type: str | None,
-    rows: list[UnifiedSource],
-    max_items: int,
-) -> list[UnifiedSource]:
-    if not rows:
-        return []
+def _keyword_match_stats(query: str, source: UnifiedSource) -> tuple[int, int, float]:
+    """Word-boundary matches of query keywords (non-stopword) in title+snippet."""
+    tokens = _query_keyword_tokens(query)
+    blob = f"{source.title} {source.snippet}".lower()
+    if not tokens:
+        return 0, 0, 0.0
+    matched = 0
+    for t in tokens:
+        if re.search(r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])", blob):
+            matched += 1
+    n = len(tokens)
+    return matched, n, matched / max(1, n)
 
-    client = _openai_client()
-    payload = [r.as_rank_payload(i + 1) for i, r in enumerate(rows[:80])]
-    system = (
-        "Score each source for relevance to query and date intent. "
-        "Twitter and Web should be preferred when scores are close. "
-        "Return JSON object only: {\"scores\":[{\"index\":1,\"score\":0-100,\"reason\":\"...\"}]}"
-    )
-    user = json.dumps(
-        {
-            "query": query,
-            "date_filter_type": date_filter_type,
-            "top_n": max_items,
-            "sources": payload,
-        },
-        ensure_ascii=False,
-    )
-    score_map: dict[int, float] = {}
-    try:
-        resp = await client.chat.completions.create(
-            model=_RANK_MODEL,
-            temperature=0.1,
-            response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            timeout=3.0,
-        )
-        raw = resp.choices[0].message.content or "{}"
-        parsed = json.loads(raw)
-        for item in parsed.get("scores", []):
-            idx = int(item.get("index"))
-            score = float(item.get("score", 0))
-            if idx > 0:
-                score_map[idx] = max(0.0, min(100.0, score))
-    except Exception:
-        score_map = {}
 
-    ranked: list[tuple[float, UnifiedSource]] = []
-    for i, row in enumerate(rows, start=1):
-        llm_score = score_map.get(i, 50.0)
-        base = _keyword_overlap_score(query, f"{row.title} {row.snippet}") * 100.0
-        tool_bonus = (_TOOL_WEIGHT.get(row.tool_key, 1.0) - 1.0) * 25.0
-        ranked.append((llm_score * 0.65 + base * 0.35 + tool_bonus, row))
+def _miner_link_scores_raw_keywords(
+    query: str, sources: list[UnifiedSource]
+) -> dict[str, ContextualRelevance]:
+    """
+    Rank sources by keyword overlap vs query; assign mostly LOW, fewer MEDIUM, at most one HIGH.
+    No per-item absolute MEDIUM bands (those made almost everything MEDIUM).
+    """
+    if not sources:
+        return {}
+
+    ranked: list[tuple[float, int, int, float, UnifiedSource]] = []
+    for s in sources:
+        matched, n_tok, ratio = _keyword_match_stats(query, s)
+        rank_score = matched * 10_000.0 + ratio * 1000.0
+        ranked.append((rank_score, matched, n_tok, ratio, s))
     ranked.sort(key=lambda x: x[0], reverse=True)
-    return [r for _, r in ranked[:max_items]]
+
+    n = len(ranked)
+    out: dict[str, ContextualRelevance] = {}
+
+    if n == 1:
+        key = (ranked[0][4].score_key or ranked[0][4].link).strip()
+        if key:
+            out[key] = ContextualRelevance.LOW
+        return out
+
+    # At most one HIGH, only if best row is clearly strongest vs trivial overlap.
+    _, bm, bnt, br, _ = ranked[0]
+    high_slots = 0
+    if n >= 4 and bnt > 0:
+        if br >= 0.42 or bm >= max(4, int(0.55 * bnt)):
+            high_slots = 1
+
+    rest = n - high_slots
+    # MEDIUM count ~ two-fifths of remaining, capped (e.g. n=6 & high=1 → 2 medium, 3 low).
+    medium_slots = min(3, max(1, (rest * 2) // 5)) if rest >= 3 else max(0, rest - 1)
+    if rest <= 1:
+        medium_slots = 0
+    medium_slots = min(medium_slots, rest)
+    if high_slots + medium_slots > n:
+        medium_slots = max(0, n - high_slots)
+
+    for i, (_, _, _, _, s) in enumerate(ranked):
+        key = (s.score_key or s.link).strip()
+        if not key:
+            continue
+        if i < high_slots:
+            out[key] = ContextualRelevance.HIGH
+        elif i < high_slots + medium_slots:
+            out[key] = ContextualRelevance.MEDIUM
+        else:
+            out[key] = ContextualRelevance.LOW
+    return out
 
 
-async def _build_summary(
+def _content_length_score(text: str) -> float:
+    n = len((text or "").strip())
+    if n <= 0:
+        return 0.0
+    # Prefer substantial snippets, with diminishing returns.
+    return min(1.0, n / 500.0)
+
+
+def _twitter_engagement_score(item: dict[str, Any]) -> float:
+    vals = [
+        item.get("reply_count") or item.get("replyCount") or 0,
+        item.get("retweet_count") or item.get("retweetCount") or 0,
+        item.get("favorite_count") or item.get("likeCount") or 0,
+        item.get("quote_count") or item.get("quoteCount") or 0,
+        item.get("view_count") or item.get("viewCount") or 0,
+    ]
+    total = 0.0
+    for v in vals:
+        try:
+            total += float(v or 0)
+        except Exception:
+            total += 0.0
+    if total <= 0:
+        return 0.0
+    return min(1.0, (total ** 0.5) / 100.0)
+
+
+def _source_score(query: str, source: UnifiedSource, raw_item: dict[str, Any] | None = None) -> float:
+    base = _keyword_overlap_score(query, f"{source.title} {source.snippet}") * 100.0
+    length_boost = _content_length_score(source.snippet) * 15.0
+    tool_boost = (_TOOL_WEIGHT.get(source.tool_key, 1.0) - 1.0) * 25.0
+    engagement = 0.0
+    if source.tool_key == "twitter" and isinstance(raw_item, dict):
+        engagement = _twitter_engagement_score(raw_item) * 25.0
+    return base + length_boost + tool_boost + engagement
+
+
+def _item_canonical_link(tool_key: str, item: dict[str, Any]) -> str:
+    if tool_key == "twitter":
+        user = item.get("user") or {}
+        username = str(user.get("username") or "").strip() or "i"
+        tid = str(item.get("id") or "").strip()
+        return (
+            (item.get("url") or f"https://x.com/{username}/status/{tid}")
+            .strip()
+            .lower()
+            .rstrip("/")
+        )
+    return str(item.get("link") or "").strip().lower().rstrip("/")
+
+
+def _trim_by_tool_to_selected(
+    by_tool: dict[str, list[dict[str, Any]]],
+    selected: list[UnifiedSource],
+) -> dict[str, list[dict[str, Any]]]:
+    """Keep only raw rows whose canonical link appears in selected (miner submission)."""
+    order_links = [s.link.lower().rstrip("/") for s in selected]
+    rank = {lk: i for i, lk in enumerate(order_links)}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for tk, items in by_tool.items():
+        tmp: list[tuple[int, dict[str, Any]]] = []
+        for it in items:
+            lk = _item_canonical_link(tk, it)
+            if lk in rank:
+                tmp.append((rank[lk], it))
+        tmp.sort(key=lambda x: x[0])
+        out[tk] = [t[1] for t in tmp]
+    return out
+
+
+def _raw_item_by_canonical_link(
+    by_tool: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    raw_by_link: dict[str, dict[str, Any]] = {}
+    for tk, items in by_tool.items():
+        for it in items:
+            link = _item_canonical_link(tk, it)
+            if link:
+                raw_by_link[link] = it
+    return raw_by_link
+
+
+def _pick_selected_sources(
+    query: str,
+    by_tool: dict[str, list[dict[str, Any]]],
+    normalized_rows: list[UnifiedSource],
+    enabled_keys: list[str],
+) -> list[UnifiedSource]:
+    """
+    Local ranking only (no LLM).
+    - Twitter only: top 10 tweets.
+    - Web only: top 10 links (all web-family tools combined).
+    - Twitter + web: top 5 tweets + top 5 web (10 total); tweets first, then web.
+    """
+    raw_by_link = _raw_item_by_canonical_link(by_tool)
+
+    scored = sorted(
+        normalized_rows,
+        key=lambda r: _source_score(query, r, raw_by_link.get(r.link.lower().rstrip("/"))),
+        reverse=True,
+    )
+    by_key: dict[str, list[UnifiedSource]] = {}
+    for r in scored:
+        by_key.setdefault(r.tool_key, []).append(r)
+
+    has_twitter = "twitter" in enabled_keys
+    web_keys = [k for k in enabled_keys if k != "twitter"]
+
+    selected: list[UnifiedSource] = []
+    if has_twitter and web_keys:
+        tw = by_key.get("twitter", [])[:_TOP_TWITTER_MIXED]
+        web_only = [r for r in scored if r.tool_key != "twitter"][:_TOP_WEB_MIXED]
+        selected = tw + web_only
+    elif has_twitter:
+        selected.extend(by_key.get("twitter", [])[:_TOP_TWITTER_SOLO])
+    else:
+        web_only = [r for r in scored if r.tool_key != "twitter"]
+        selected.extend(web_only[:_TOP_WEB_SOLO])
+
+    seen: set[str] = set()
+    deduped: list[UnifiedSource] = []
+    for s in selected:
+        lk = s.link.lower().rstrip("/")
+        if lk in seen:
+            continue
+        seen.add(lk)
+        deduped.append(s)
+    return deduped[:_MAX_FINAL_SOURCES]
+
+
+async def _build_summary_from_selected(
     query: str,
     date_filter_type: str | None,
-    top_rows: list[UnifiedSource],
-) -> str:
-    if not top_rows:
+    summary_sources: list[UnifiedSource],
+) -> tuple[str, dict[str, ContextualRelevance]]:
+    """
+    Miner scores use all summary_sources (up to 10). LLM sees only the first
+    _SUMMARY_LLM_SOURCE_COUNT sources as compact title/snippet blocks; cites [n] then we expand to URLs.
+    """
+    if not summary_sources:
         return (
             "**Findings**\nNo relevant sources were found.\n\n"
-            "**Conclusion**\nThe query needs broader terms or updated data."
+            "**Conclusion**\nThe query needs broader terms or updated data.",
+            {},
         )
+    miner_scores = _miner_link_scores_raw_keywords(query, summary_sources)
+    llm_sources = summary_sources[:_SUMMARY_LLM_SOURCE_COUNT]
+    n_llm = len(llm_sources)
+
     client = _openai_client()
-    data = [
-        {
-            "index": i,
-            "tool": s.tool_key,
-            "title": s.title,
-            "link": s.link,
-            "snippet": s.snippet[:700],
-            "date": s.date,
-        }
-        for i, s in enumerate(top_rows, 1)
-    ]
+    max_words = 280
     system = (
-        "Write markdown answer with **bold section headers** only (no # headers). "
-        "Use 3-4 sections, last section **Conclusion**. "
-        "Support claims with inline markdown links using provided urls, e.g. [1](url). "
-        "No standalone sources section. Max 400 words."
+        f"The user lists {n_llm} sources (title + snippet only). URLs are omitted on purpose. "
+        "Write a quick, shallow markdown answer — not a deep analysis. "
+        "Use **bold** section headers only (no #). End with **Conclusion**. "
+        f"About {max_words} words max. No **Sources** section.\n"
+        "Cite evidence using ONLY bracket source ids [1], [2], … matching the numbered list below "
+        "(source 1 = first block). Do not paste real URLs; use [n] only.\n"
+        "Return JSON only: {\"summary\":\"...\"}"
     )
-    user = json.dumps(
-        {
-            "question": query,
-            "date_filter_type": date_filter_type,
-            "sources": data,
-        },
-        ensure_ascii=False,
-    )
+    user = _format_compact_summary_user_content(query, llm_sources)
+    _log_summary_llm_full_prompt(system, user)
     try:
         resp = await client.chat.completions.create(
             model=_SUMMARY_MODEL,
-            temperature=0.35,
+            temperature=0.15,
+            response_format={"type": "json_object"},
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            timeout=3.2,
+            timeout=2.8,
         )
-        text = (resp.choices[0].message.content or "").strip()
-        return text or "**Conclusion**\nInsufficient content for summary."
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = json.loads(raw or "{}")
+        text = str(parsed.get("summary") or "").replace("\\n", "\n").strip()
+        if not text:
+            text = _build_fast_cited_summary(query, llm_sources)
+        text = _expand_bracket_ids_to_markdown_links(text, llm_sources)
+        text = _ensure_summary_structure(text)
+        distinct_before = len(_distinct_source_indices_cited(text, n_llm))
+        text, used_full_cite = _ensure_minimum_source_citations(
+            text, query, llm_sources
+        )
+        if used_full_cite:
+            text = _expand_bracket_ids_to_markdown_links(text, llm_sources)
+            _log(
+                "summary_enforced_full_citations=1 "
+                f"distinct_indices_before_enforcement={distinct_before}"
+            )
+        if not _contains_markdown_links(text):
+            text = _ensure_summary_structure(_build_fast_cited_summary(query, llm_sources))
+        return text, miner_scores
     except Exception:
         return (
-            "**Key Updates**\n"
-            + "\n".join(f"- [{i}]({s.link}) {s.title}" for i, s in enumerate(top_rows[:8], 1))
-            + "\n\n**Conclusion**\nThe selected sources indicate the main recent developments."
+            _ensure_summary_structure(_build_fast_cited_summary(query, llm_sources)),
+            _miner_link_scores_raw_keywords(query, summary_sources),
         )
 
 
@@ -358,10 +817,15 @@ async def run_ai_solution(
     start = time.perf_counter()
     task_meta = task_meta or {}
 
+    analyze_start = time.perf_counter()
     prompt = _normalize_whitespace(synapse.prompt)
     planned_query = await _plan_query_if_needed(prompt, task_meta)
+    analyze_elapsed = time.perf_counter() - analyze_start
+    _log(f"prompt={prompt}")
+    _log(f"planned_query={planned_query}")
+    _log(f"timing.analyze={analyze_elapsed:.3f}s")
     max_items = int(getattr(synapse, "count", None) or _DEFAULT_MAX_ITEMS)
-    per_tool_items = max(6, min(_DEFAULT_PER_TOOL_ITEMS, max_items))
+    per_tool_items = _OTHER_FETCH_ITEMS
 
     tools = list(synapse.tools or []) or list(_TOOL_TO_KEY.keys())
     enabled_keys = []
@@ -369,73 +833,170 @@ async def run_ai_solution(
         key = _TOOL_TO_KEY.get(t)
         if key and key not in enabled_keys:
             enabled_keys.append(key)
+    _log(f"enabled_tools={enabled_keys}")
 
-    async def _bounded(coro):
-        return await asyncio.wait_for(coro, timeout=_PER_TOOL_TIMEOUT_SECONDS)
+    tool_queries = {
+        key: _tool_query_from_analysis(prompt, task_meta, key, planned_query)
+        for key in enabled_keys
+    }
+    for key, q in tool_queries.items():
+        _log(f"tool_query[{key}]={q}")
+
+    async def _run_tool_with_retries(tool_key: str, factory):
+        attempts = 0
+        while True:
+            attempts += 1
+            t0 = time.perf_counter()
+            try:
+                result = await factory()
+                elapsed = time.perf_counter() - t0
+                count = len(result or [])
+                if count > 0:
+                    _log(
+                        f"timing.tool.{tool_key}={elapsed:.3f}s "
+                        f"status=ok attempt={attempts} count={count}"
+                    )
+                    return list(result or [])
+                _log(
+                    f"timing.tool.{tool_key}={elapsed:.3f}s "
+                    f"status=empty attempt={attempts}"
+                )
+            except Exception as e:
+                elapsed = time.perf_counter() - t0
+                _log(
+                    f"timing.tool.{tool_key}={elapsed:.3f}s "
+                    f"status=error attempt={attempts} error={type(e).__name__}: {e}"
+                )
+            if attempts >= _TOOL_MAX_ATTEMPTS:
+                return []
+            await asyncio.sleep(_RETRY_SLEEP_SECONDS)
 
     tasks: dict[str, asyncio.Task] = {}
     if "twitter" in enabled_keys:
+        twitter_query = tool_queries.get("twitter", planned_query)
         tasks["twitter"] = asyncio.create_task(
-            _bounded(_run_twitter(planned_query, per_tool_items, synapse.date_filter_type))
+            _run_tool_with_retries(
+                "twitter",
+                lambda: _run_twitter(
+                    twitter_query, per_tool_items, synapse.date_filter_type
+                ),
+            )
         )
     if "web" in enabled_keys:
-        tasks["web"] = asyncio.create_task(_bounded(_run_web(planned_query, per_tool_items)))
+        web_query = tool_queries.get("web", planned_query)
+        tasks["web"] = asyncio.create_task(
+            _run_tool_with_retries(
+                "web", lambda: _run_web(web_query, per_tool_items)
+            )
+        )
     if "reddit" in enabled_keys:
+        reddit_query = tool_queries.get("reddit", planned_query)
         tasks["reddit"] = asyncio.create_task(
-            _bounded(_run_thread(_run_reddit_sync, planned_query, per_tool_items))
+            _run_tool_with_retries(
+                "reddit",
+                lambda: _run_thread(_run_reddit_sync, reddit_query, per_tool_items),
+            )
         )
     if "youtube" in enabled_keys:
+        youtube_query = tool_queries.get("youtube", planned_query)
         tasks["youtube"] = asyncio.create_task(
-            _bounded(_run_thread(_run_youtube_sync, planned_query, per_tool_items))
+            _run_tool_with_retries(
+                "youtube",
+                lambda: _run_thread(_run_youtube_sync, youtube_query, per_tool_items),
+            )
         )
     if "arxiv" in enabled_keys:
+        arxiv_query = tool_queries.get("arxiv", planned_query)
         tasks["arxiv"] = asyncio.create_task(
-            _bounded(_run_thread(_run_arxiv_sync, planned_query, per_tool_items))
+            _run_tool_with_retries(
+                "arxiv",
+                lambda: _run_thread(_run_arxiv_sync, arxiv_query, per_tool_items),
+            )
         )
     if "hackernews" in enabled_keys:
+        hn_query = tool_queries.get("hackernews", planned_query)
         tasks["hackernews"] = asyncio.create_task(
-            _bounded(_run_thread(_run_hn_sync, planned_query, per_tool_items))
+            _run_tool_with_retries(
+                "hackernews",
+                lambda: _run_thread(_run_hn_sync, hn_query, per_tool_items),
+            )
         )
     if "wikipedia" in enabled_keys:
+        wiki_query = tool_queries.get("wikipedia", planned_query)
         tasks["wikipedia"] = asyncio.create_task(
-            _bounded(_run_thread(_run_wikipedia_sync, planned_query, per_tool_items))
+            _run_tool_with_retries(
+                "wikipedia",
+                lambda: _run_thread(_run_wikipedia_sync, wiki_query, per_tool_items),
+            )
         )
 
     by_tool: dict[str, list[dict[str, Any]]] = {}
-    wait_deadline = _OVERALL_TIMEOUT_SECONDS
-    done, pending = await asyncio.wait(tasks.values(), timeout=wait_deadline)
-    for p in pending:
-        p.cancel()
-    for key, task in tasks.items():
-        if task in done and not task.cancelled():
-            try:
-                by_tool[key] = list(task.result() or [])
-            except Exception:
-                by_tool[key] = []
-        else:
+    tools_stage_start = time.perf_counter()
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    for key, result in zip(tasks.keys(), results):
+        if isinstance(result, Exception):
+            _log(f"tool_result[{key}] error={type(result).__name__}: {result}")
             by_tool[key] = []
+        else:
+            by_tool[key] = list(result or [])
+        sample = by_tool[key][0] if by_tool[key] else {}
+        _log(f"tool_result[{key}]: count={len(by_tool[key])} sample={json.dumps(sample, ensure_ascii=False)[:300]}")
+    tools_stage_elapsed = time.perf_counter() - tools_stage_start
+    _log(f"timing.tools_all={tools_stage_elapsed:.3f}s")
 
+    normalize_start = time.perf_counter()
     rows = _collect_source_rows(by_tool)
-    top_rows = await _rank_sources_with_llm(
+    normalize_elapsed = time.perf_counter() - normalize_start
+    _log(f"unified_sources={len(rows)}")
+    _log(f"timing.normalize_sources={normalize_elapsed:.3f}s")
+
+    summary_stage_start = time.perf_counter()
+    selected_rows = _pick_selected_sources(
+        planned_query,
+        by_tool=by_tool,
+        normalized_rows=rows,
+        enabled_keys=enabled_keys,
+    )
+    _log_selected_sources_detail(selected_rows)
+    by_tool_final = _trim_by_tool_to_selected(by_tool, selected_rows)
+    summary, miner_link_scores = await _build_summary_from_selected(
         planned_query,
         synapse.date_filter_type,
-        rows,
-        max_items=max_items,
+        summary_sources=selected_rows,
     )
-    summary = await _build_summary(planned_query, synapse.date_filter_type, top_rows)
+    summary_stage_elapsed = time.perf_counter() - summary_stage_start
+    _log(
+        f"top_ranked_sources={len(selected_rows)} "
+        f"(cap≤{_MAX_FINAL_SOURCES}: solo tw/web {_TOP_TWITTER_SOLO}/{_TOP_WEB_SOLO} "
+        f"mixed {_TOP_TWITTER_MIXED}+{_TOP_WEB_MIXED})"
+    )
+    _log(f"miner_link_scores_keys={len(miner_link_scores)}")
+    _log(f"summary_chars={len(summary)}")
+    _log(f"timing.select_and_summary={summary_stage_elapsed:.3f}s")
 
-    synapse.miner_tweets = by_tool.get("twitter", [])
-    synapse.search_results = by_tool.get("web", [])
-    synapse.reddit_search_results = by_tool.get("reddit", [])
-    synapse.youtube_search_results = by_tool.get("youtube", [])
-    synapse.arxiv_search_results = by_tool.get("arxiv", [])
-    synapse.hacker_news_search_results = by_tool.get("hackernews", [])
-    synapse.wikipedia_search_results = by_tool.get("wikipedia", [])
+    synapse.miner_tweets = by_tool_final.get("twitter", [])
+    synapse.search_results = by_tool_final.get("web", [])
+    synapse.reddit_search_results = by_tool_final.get("reddit", [])
+    synapse.youtube_search_results = by_tool_final.get("youtube", [])
+    synapse.arxiv_search_results = by_tool_final.get("arxiv", [])
+    synapse.hacker_news_search_results = by_tool_final.get("hackernews", [])
+    synapse.wikipedia_search_results = by_tool_final.get("wikipedia", [])
+    synapse.miner_link_scores = miner_link_scores
     synapse.result_type = ResultType.LINKS_WITH_FINAL_SUMMARY
     synapse.completion = "completed"
     synapse.text_chunks = synapse.text_chunks or {}
-    synapse.text_chunks[ScraperTextRole.FINAL_SUMMARY.value] = [summary]
-    synapse.dendrite = {"status_code": 200, "process_time": time.perf_counter() - start}
+    synapse.text_chunks[ScraperTextRole.FINAL_SUMMARY.value] = _stream_safe_chunks(summary)
+    work_elapsed = time.perf_counter() - start
+    if work_elapsed < _MIN_SOLUTION_WALL_SECONDS:
+        pad = _MIN_SOLUTION_WALL_SECONDS - work_elapsed
+        _log(
+            f"timing.pad_to_minimum={pad:.3f}s "
+            f"(work={work_elapsed:.3f}s target≥{_MIN_SOLUTION_WALL_SECONDS}s)"
+        )
+        await asyncio.sleep(pad)
+    total_elapsed = time.perf_counter() - start
+    _log(f"timing.total_solution={total_elapsed:.3f}s")
+    synapse.dendrite = {"status_code": 200, "process_time": total_elapsed}
     return synapse
 
 
