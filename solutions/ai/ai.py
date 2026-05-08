@@ -286,11 +286,45 @@ def _snippet_for_prompt(text: str, max_chars: int) -> str:
     return t[: max_chars - 3].rstrip() + "..."
 
 
+def _query_keyword_hints_for_summary(task_question: str, max_terms: int = 18) -> str:
+    """
+    Extract many substantive tokens from the user question so the summary model can
+    mirror validator SummaryRelevancePrompt expectations (address query vocabulary /
+    themes with citations).
+    """
+    q = _normalize_whitespace(task_question)
+    if not q:
+        return ""
+    lower = q.lower()
+    tokens = re.findall(r"[a-z][a-z0-9]{2,}", lower)
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in tokens:
+        if t in _STOPWORDS:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_terms:
+            break
+    return ", ".join(out)
+
+
 def _format_compact_summary_user_content(
     task_question: str, sources: list[UnifiedSource]
 ) -> str:
     """Short numbered blocks: title + snippet only (no URLs)."""
     lines = [f"Question:\n{task_question.strip()[:1200]}", ""]
+    hints = _query_keyword_hints_for_summary(task_question)
+    if hints:
+        lines.append(
+            "Query keywords and themes — weave these terms naturally through **Findings** and "
+            "**Conclusion** wherever the snippets below support them (validators reward "
+            "directly addressing the question and matching its vocabulary):"
+        )
+        lines.append(hints)
+        lines.append("")
     for i, s in enumerate(sources, 1):
         title = (s.title or "").replace("\n", " ").strip()
         snip = _snippet_for_prompt(s.snippet or "", _SUMMARY_LLM_SNIPPET_CHARS)
@@ -418,13 +452,21 @@ async def _run_compact_summary_llm(
     """Single JSON summary; same model as labels; runs in parallel with label worker."""
     n_llm = len(llm_sources)
     max_words = 280
+    # Align with desearch SummaryRelevancePrompt / system_summary_relevance_template:
+    # ** headers (no #), integrated [n] citations, answer must address the question and use
+    # query vocabulary where sources support it.
     system = (
-        f"The user lists {n_llm} sources (title + snippet only). URLs are omitted on purpose. "
-        "Write a quick, shallow markdown answer — not a deep analysis. "
-        "Use **bold** section headers only (no #). End with **Conclusion**. "
-        f"About {max_words} words max. No **Sources** section.\n"
-        "Cite evidence using ONLY bracket source ids [1], [2], … matching the numbered list below "
-        "(source 1 = first block). Do not paste real URLs; use [n] only.\n"
+        f"You write the final summary for a subnet validator. The user provides {n_llm} numbered "
+        "sources (title + snippet only; URLs omitted).\n"
+        "Scoring rubric you must satisfy when snippets allow:\n"
+        "- Use **Section Name** headers only — never # markdown headings.\n"
+        "- Directly answer the user's question; integrate the listed query keywords/themes "
+        "naturally in prose (especially **Findings**, **Conclusion**) — shallow repetition is OK "
+        "if it ties claims to the question.\n"
+        "- Tie claims to sources using bracket ids [1], [2], … in reading order (source 1 = first "
+        "block). Prefer citing several distinct indices across paragraphs; do not paste bare URLs.\n"
+        "- Keep it concise (~{max_words} words), not a dissertation. No separate **Sources** section.\n"
+        "End with a **Conclusion** section.\n"
         "Return JSON only: {\"summary\":\"...\"}"
     )
     user = _format_compact_summary_user_content(query, llm_sources)
@@ -548,10 +590,17 @@ def _build_fast_cited_summary(query: str, sources: list[UnifiedSource]) -> str:
         lines.append(f"- {snippet} [{i}]({src.link})")
     lines.append("")
     lines.append("**Conclusion**")
-    lines.append(
-        f"These sources indicate the key developments for: {query}. "
-        "The cited evidence highlights current impact and practical security implications."
-    )
+    hints = _query_keyword_hints_for_summary(query)
+    if hints:
+        lines.append(
+            f"Themes aligned with the query ({hints}) appear across the cited material above; "
+            "together they support assessing impact and practical implications."
+        )
+    else:
+        lines.append(
+            f"These sources indicate the key developments for: {query}. "
+            "The cited evidence highlights current impact and practical implications."
+        )
     return "\n".join(lines)
 
 
