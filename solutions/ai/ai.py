@@ -40,8 +40,6 @@ _QUERY_MODEL = "gpt-4.1-nano"
 _SUMMARY_MODEL = "gpt-4.1-nano"
 
 _DEFAULT_MAX_ITEMS = 20
-_TOOL_MAX_ATTEMPTS = 3
-_RETRY_SLEEP_SECONDS = 0.6
 # Validator performance curve expects plausible duration; pad fast runs to this minimum wall time.
 _MIN_SOLUTION_WALL_SECONDS = 5.5
 _TWITTER_FETCH_ITEMS = 30
@@ -557,25 +555,43 @@ def _build_fast_cited_summary(query: str, sources: list[UnifiedSource]) -> str:
     return "\n".join(lines)
 
 
-def _extract_query(task_query: str, task_meta: dict[str, Any]) -> str:
-    ai_analysis = task_meta.get("ai_search_analysis") or {}
-    rules = ai_analysis.get("tool_search_rules") or {}
-    candidate_terms: list[str] = []
-    for spec in rules.values():
-        if isinstance(spec, dict):
-            for q in spec.get("search_query_candidates", [])[:2]:
-                if isinstance(q, str) and q.strip():
-                    candidate_terms.append(q.strip())
-    if candidate_terms:
-        merged = ", ".join(candidate_terms[:4])
-        return _normalize_whitespace(f"{task_query} {merged}")
-    return _normalize_whitespace(task_query)
+def _keyword_focus_query(task_query: str, max_words: int = 3) -> str:
+    """
+    Reduce a long natural-language prompt to 2–3 substantive tokens for ranking and
+    shared tool fallback (not a full sentence).
+    """
+    q = _normalize_whitespace(task_query)
+    if not q:
+        return q
+    lower = q.lower()
+    tokens = re.findall(r"[a-z][a-z0-9]{2,}", lower)
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in tokens:
+        if t in _STOPWORDS:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_words:
+            break
+    if len(out) >= 2:
+        return " ".join(out)
+    if len(out) == 1:
+        return out[0]
+    words = [w for w in re.findall(r"\w+", q) if len(w) >= 3][:max_words]
+    return " ".join(words) if words else q
 
 
 async def _plan_query_if_needed(task_query: str, task_meta: dict[str, Any]) -> str:
-    # Keep AI-task planning deterministic and fast:
-    # use analyzer-provided hints directly, without extra LLM hop.
-    return _extract_query(task_query, task_meta)
+    analysis = task_meta.get("ai_search_analysis") or {}
+    ck = analysis.get("canonical_keywords_for_validation")
+    if isinstance(ck, list) and ck:
+        first = str(ck[0]).strip()
+        if first:
+            return _normalize_whitespace(first)
+    return _keyword_focus_query(_normalize_whitespace(task_query))
 
 
 def _tool_query_from_analysis(
@@ -1005,40 +1021,36 @@ async def run_ai_solution(
     for key, q in tool_queries.items():
         _log(f"tool_query[{key}]={q}")
 
-    async def _run_tool_with_retries(tool_key: str, factory):
-        attempts = 0
-        while True:
-            attempts += 1
-            t0 = time.perf_counter()
-            try:
-                result = await factory()
-                elapsed = time.perf_counter() - t0
-                count = len(result or [])
-                if count > 0:
-                    _log(
-                        f"timing.tool.{tool_key}={elapsed:.3f}s "
-                        f"status=ok attempt={attempts} count={count}"
-                    )
-                    return list(result or [])
+    async def _run_tool_once(tool_key: str, factory):
+        t0 = time.perf_counter()
+        try:
+            result = await factory()
+            elapsed = time.perf_counter() - t0
+            count = len(result or [])
+            if count > 0:
                 _log(
                     f"timing.tool.{tool_key}={elapsed:.3f}s "
-                    f"status=empty attempt={attempts}"
+                    f"status=ok attempt=1 count={count}"
                 )
-            except Exception as e:
-                elapsed = time.perf_counter() - t0
-                _log(
-                    f"timing.tool.{tool_key}={elapsed:.3f}s "
-                    f"status=error attempt={attempts} error={type(e).__name__}: {e}"
-                )
-            if attempts >= _TOOL_MAX_ATTEMPTS:
-                return []
-            await asyncio.sleep(_RETRY_SLEEP_SECONDS)
+                return list(result or [])
+            _log(
+                f"timing.tool.{tool_key}={elapsed:.3f}s "
+                f"status=empty attempt=1"
+            )
+            return []
+        except Exception as e:
+            elapsed = time.perf_counter() - t0
+            _log(
+                f"timing.tool.{tool_key}={elapsed:.3f}s "
+                f"status=error attempt=1 error={type(e).__name__}: {e}"
+            )
+            return []
 
     tasks: dict[str, asyncio.Task] = {}
     if "twitter" in enabled_keys:
         twitter_query = tool_queries.get("twitter", planned_query)
         tasks["twitter"] = asyncio.create_task(
-            _run_tool_with_retries(
+            _run_tool_once(
                 "twitter",
                 lambda: _run_twitter(
                     twitter_query, per_tool_items, synapse.date_filter_type
@@ -1048,14 +1060,14 @@ async def run_ai_solution(
     if "web" in enabled_keys:
         web_query = tool_queries.get("web", planned_query)
         tasks["web"] = asyncio.create_task(
-            _run_tool_with_retries(
+            _run_tool_once(
                 "web", lambda: _run_web(web_query, per_tool_items)
             )
         )
     if "reddit" in enabled_keys:
         reddit_query = tool_queries.get("reddit", planned_query)
         tasks["reddit"] = asyncio.create_task(
-            _run_tool_with_retries(
+            _run_tool_once(
                 "reddit",
                 lambda: _run_thread(_run_reddit_sync, reddit_query, per_tool_items),
             )
@@ -1063,7 +1075,7 @@ async def run_ai_solution(
     if "youtube" in enabled_keys:
         youtube_query = tool_queries.get("youtube", planned_query)
         tasks["youtube"] = asyncio.create_task(
-            _run_tool_with_retries(
+            _run_tool_once(
                 "youtube",
                 lambda: _run_thread(_run_youtube_sync, youtube_query, per_tool_items),
             )
@@ -1071,7 +1083,7 @@ async def run_ai_solution(
     if "arxiv" in enabled_keys:
         arxiv_query = tool_queries.get("arxiv", planned_query)
         tasks["arxiv"] = asyncio.create_task(
-            _run_tool_with_retries(
+            _run_tool_once(
                 "arxiv",
                 lambda: _run_thread(_run_arxiv_sync, arxiv_query, per_tool_items),
             )
@@ -1079,7 +1091,7 @@ async def run_ai_solution(
     if "hackernews" in enabled_keys:
         hn_query = tool_queries.get("hackernews", planned_query)
         tasks["hackernews"] = asyncio.create_task(
-            _run_tool_with_retries(
+            _run_tool_once(
                 "hackernews",
                 lambda: _run_thread(_run_hn_sync, hn_query, per_tool_items),
             )
@@ -1087,7 +1099,7 @@ async def run_ai_solution(
     if "wikipedia" in enabled_keys:
         wiki_query = tool_queries.get("wikipedia", planned_query)
         tasks["wikipedia"] = asyncio.create_task(
-            _run_tool_with_retries(
+            _run_tool_once(
                 "wikipedia",
                 lambda: _run_thread(_run_wikipedia_sync, wiki_query, per_tool_items),
             )
