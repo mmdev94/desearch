@@ -92,6 +92,277 @@ def _label_parity_rows(
     return rows
 
 
+def _normalize_link_for_match(url: str) -> str:
+    """Stable comparison key for matching miner result rows to a canonical URL."""
+    s = (url or "").strip()
+    if not s:
+        return ""
+    s = s.rstrip("/")
+    return s.lower()
+
+
+def _item_link_title_snippet(field: Any) -> tuple[str, str, str]:
+    """Works for plain dicts or SearchResultItem-like objects (synapse round-trip)."""
+    if isinstance(field, dict):
+        lk = str(field.get("link") or "").strip()
+        title = str(field.get("title") or "").strip()
+        snip = str(field.get("snippet") or "").strip()
+        return lk, title, snip
+    lk = str(getattr(field, "link", None) or "").strip()
+    title = str(getattr(field, "title", None) or "").strip()
+    snip = str(getattr(field, "snippet", None) or "").strip()
+    return lk, title, snip
+
+
+def _iter_all_search_result_rows(synapse) -> list[Any]:
+    return list(
+        (synapse.search_results or [])
+        + (synapse.wikipedia_search_results or [])
+        + (synapse.youtube_search_results or [])
+        + (synapse.arxiv_search_results or [])
+        + (synapse.reddit_search_results or [])
+        + (synapse.hacker_news_search_results or [])
+    )
+
+
+def _find_title_snippet_for_link(synapse, target_link: str) -> tuple[str, str]:
+    """Resolve title + snippet for a URL across all miner search buckets."""
+    want = _normalize_link_for_match(target_link)
+    if not want:
+        return "", ""
+    for field in _iter_all_search_result_rows(synapse):
+        lk, title, snip = _item_link_title_snippet(field)
+        if not lk:
+            continue
+        if _normalize_link_for_match(lk) == want:
+            return title, snip
+    return "", ""
+
+
+async def _log_miner_validator_prompt_parity(
+    synapse,
+    twitter_model,
+    web_model,
+) -> dict[str, Any]:
+    """
+    Pick one sample link (web preferred, else twitter). Print full system/user prompts for
+    validator reward models vs miner solution, run call_openai twice (same model/temp as RewardLLM),
+    print raw completions and extract_score parity.
+    """
+    from desearch.utils import call_openai
+    from neurons.validators.utils.prompts import LinkContentPrompt, SearchSummaryRelevancePrompt
+    from solutions.ai.ai import (
+        UnifiedSource,
+        _LABEL_TEMPERATURE,
+        _SUMMARY_MODEL,
+        _search_relevance_system_message,
+        _snap_to_validator_score,
+        _validator_score_to_relevance,
+        _validator_single_link_user_message,
+    )
+
+    def _bucket(num: float) -> str:
+        rel = _validator_score_to_relevance(_snap_to_validator_score(float(num)))
+        return getattr(rel, "value", str(rel))
+
+    prompt_text = (synapse.prompt or "").strip()
+    scoring_ov = getattr(synapse, "scoring_system_message", None)
+    sp_web = SearchSummaryRelevancePrompt()
+
+    out: dict[str, Any] = {
+        "model": _SUMMARY_MODEL,
+        "temperature": _LABEL_TEMPERATURE,
+        "question_prompt": prompt_text,
+        "sample_kind": None,
+    }
+
+    _, links_per_group = synapse.get_links_from_search_results()
+    sample_url: str | None = None
+    sample_title = ""
+    sample_snippet = ""
+    for _gk, links in (links_per_group or {}).items():
+        if not links:
+            continue
+        sample_url = str(links[0] or "").strip() or None
+        if not sample_url:
+            continue
+        sample_title, sample_snippet = _find_title_snippet_for_link(synapse, sample_url)
+        break
+
+    if sample_url:
+        out["sample_kind"] = "web"
+        out["sample_key"] = sample_url
+        raw_in = f"Title: {sample_title}, Description: {sample_snippet}"
+        out["validator_raw_content_before_model_clean_text"] = raw_in
+
+        val_pack = web_model.get_scoring_text(
+            prompt=prompt_text,
+            content=raw_in,
+            system_message=scoring_ov,
+            response=None,
+        )
+        if not val_pack:
+            out["error"] = "web_get_scoring_text_none"
+            print("[ai-validation-prompt-parity] sample=web ERROR=get_scoring_text_none")
+            return out
+
+        _, val_messages = val_pack
+        miner_src = UnifiedSource(
+            tool_key="web",
+            title=sample_title,
+            link=sample_url,
+            snippet=sample_snippet,
+            date=None,
+            score_key=sample_url,
+        )
+        miner_sys = _search_relevance_system_message(scoring_ov)
+        miner_user = _validator_single_link_user_message(prompt_text, miner_src)
+        miner_messages = [
+            {"role": "system", "content": miner_sys},
+            {"role": "user", "content": miner_user},
+        ]
+
+        val_resp = await call_openai(
+            val_messages, model=_SUMMARY_MODEL, temperature=_LABEL_TEMPERATURE
+        )
+        miner_resp = await call_openai(
+            miner_messages, model=_SUMMARY_MODEL, temperature=_LABEL_TEMPERATURE
+        )
+
+        val_num = float(sp_web.extract_score(val_resp or ""))
+        miner_num = float(sp_web.extract_score(miner_resp or ""))
+
+        out["validator"] = {
+            "path": "WebSearchContentRelevanceModel.get_scoring_text → call_openai",
+            "system_message": val_messages[0]["content"],
+            "user_message": val_messages[1]["content"],
+            "openai_response_text": val_resp,
+            "extract_score_numeric": val_num,
+            "snapped_bucket": _bucket(val_num),
+        }
+        out["miner_solution"] = {
+            "path": "solutions.ai _validator_single_link_user_message → call_openai",
+            "system_message": miner_sys,
+            "user_message": miner_user,
+            "openai_response_text": miner_resp,
+            "extract_score_numeric": miner_num,
+            "snapped_bucket": _bucket(miner_num),
+        }
+
+        print("[ai-validation-prompt-parity] sample=web link=" + sample_url[:200])
+        print(
+            "=== VALIDATOR (WebSearchContentRelevanceModel → RewardLLM-style call_openai) ==="
+        )
+        print("--- system ---\n" + str(val_messages[0]["content"]))
+        print("--- user ---\n" + str(val_messages[1]["content"]))
+        print("--- OpenAI response ---\n" + str(val_resp))
+        print(f"--- extract_score → snapped bucket: {val_num} → {_bucket(val_num)}")
+        print(
+            "=== MINER (solutions/ai/ai.py label messages → same call_openai) ==="
+        )
+        print("--- system ---\n" + miner_sys)
+        print("--- user ---\n" + miner_user)
+        print("--- OpenAI response ---\n" + str(miner_resp))
+        print(f"--- extract_score → snapped bucket: {miner_num} → {_bucket(miner_num)}")
+        return out
+
+    mt = list(synapse.miner_tweets or [])
+    if not mt:
+        out["error"] = "no_web_or_twitter_sample"
+        print("[ai-validation-prompt-parity] skipped=no_links_no_tweets")
+        return out
+
+    tw = mt[0]
+    tid = str(tw.get("id") or "").strip()
+    text = str(tw.get("text") or "").strip()
+    url = str(tw.get("url") or "").strip()
+    if not tid or not text:
+        out["error"] = "tweet_missing_id_or_text"
+        print("[ai-validation-prompt-parity] skipped=tweet_incomplete")
+        return out
+
+    out["sample_kind"] = "twitter"
+    out["sample_key"] = tid
+
+    val_pack = twitter_model.get_scoring_text(
+        prompt=prompt_text,
+        content=text,
+        system_message=scoring_ov,
+        response=None,
+    )
+    if not val_pack:
+        out["error"] = "twitter_get_scoring_text_none"
+        print("[ai-validation-prompt-parity] sample=twitter ERROR=get_scoring_text_none")
+        return out
+
+    _, val_messages = val_pack
+    lp = LinkContentPrompt()
+    miner_src = UnifiedSource(
+        tool_key="twitter",
+        title=(text[:120] if text else "Tweet"),
+        link=url or f"https://x.com/i/status/{tid}",
+        snippet=text,
+        date=None,
+        score_key=tid,
+    )
+    miner_sys = _search_relevance_system_message(scoring_ov)
+    miner_user = _validator_single_link_user_message(prompt_text, miner_src)
+    miner_messages = [
+        {"role": "system", "content": miner_sys},
+        {"role": "user", "content": miner_user},
+    ]
+
+    val_resp = await call_openai(
+        val_messages, model=_SUMMARY_MODEL, temperature=_LABEL_TEMPERATURE
+    )
+    miner_resp = await call_openai(
+        miner_messages, model=_SUMMARY_MODEL, temperature=_LABEL_TEMPERATURE
+    )
+
+    val_num = float(lp.extract_score(val_resp or ""))
+    miner_num = float(sp_web.extract_score(miner_resp or ""))
+
+    out["validator"] = {
+        "path": "TwitterContentRelevanceModel.get_scoring_text (LinkContentPrompt) → call_openai",
+        "system_message": val_messages[0]["content"],
+        "user_message": val_messages[1]["content"],
+        "openai_response_text": val_resp,
+        "extract_score_numeric_validator_prompt_class": val_num,
+        "snapped_bucket": _bucket(val_num),
+    }
+    out["miner_solution"] = {
+        "path": "solutions.ai _validator_single_link_user_message (SearchSummaryRelevancePrompt) → call_openai",
+        "system_message": miner_sys,
+        "user_message": miner_user,
+        "openai_response_text": miner_resp,
+        "extract_score_numeric_SearchSummaryRelevance_extract_score": miner_num,
+        "snapped_bucket": _bucket(miner_num),
+    }
+    out["note"] = (
+        "Validator twitter uses LinkContentPrompt.extract_score; miner labels use "
+        "SearchSummaryRelevancePrompt.extract_score (templates match in prompts.py)."
+    )
+
+    print("[ai-validation-prompt-parity] sample=twitter id=" + tid)
+    print(
+        "=== VALIDATOR (TwitterContentRelevanceModel → LinkContentPrompt → call_openai) ==="
+    )
+    print("--- system ---\n" + str(val_messages[0]["content"]))
+    print("--- user ---\n" + str(val_messages[1]["content"]))
+    print("--- OpenAI response ---\n" + str(val_resp))
+    print(
+        f"--- LinkContentPrompt extract_score → snapped: {val_num} → {_bucket(val_num)}"
+    )
+    print("=== MINER (solutions/ai label messages → call_openai) ===")
+    print("--- system ---\n" + miner_sys)
+    print("--- user ---\n" + miner_user)
+    print("--- OpenAI response ---\n" + str(miner_resp))
+    print(
+        f"--- SearchSummaryRelevance extract_score → snapped: {miner_num} → {_bucket(miner_num)}"
+    )
+    return out
+
+
 def _bootstrap_source_imports() -> None:
     repo_root = _repo_root()
     source_root = repo_root / "source"
@@ -295,6 +566,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         ),
     ]
 
+    prompt_parity_detail = await _log_miner_validator_prompt_parity(
+        synapse,
+        reward_models[0],
+        reward_models[1],
+    )
+
     # Keep prompt-based relevance scoring, but source validator items from miner
     # outputs (no external scraping).
     async def _twitter_process_tweets_from_miner(responses):
@@ -380,20 +657,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 # mirror validator sampling behavior: 2 if single group else 1 each
                 limit = 2 if len(links_per_tool_group) == 1 else 1
                 for link in tool_group_links[:limit]:
-                    row = {"link": link, "title": "", "snippet": ""}
-                    for field in (
-                        response.search_results
-                        + response.wikipedia_search_results
-                        + response.youtube_search_results
-                        + response.arxiv_search_results
-                        + response.reddit_search_results
-                        + response.hacker_news_search_results
-                    ):
-                        if isinstance(field, dict) and field.get("link") == link:
-                            row["title"] = str(field.get("title") or "")
-                            row["snippet"] = str(field.get("snippet") or "")
-                            break
-                    response.validator_links.append(row)
+                    t, s = _find_title_snippet_for_link(response, str(link))
+                    response.validator_links.append(
+                        {"link": link, "title": t, "snippet": s}
+                    )
             attempted_counts.append(len(response.validator_links))
             # Run original prompt-based scoring over title/snippet.
             val_score_responses = await reward_models[1].llm_process_validator_links(
@@ -582,6 +849,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "penalties_applied": {k: round(v, 6) for k, v in penalty_applied_map.items()},
             "final_validation_score": round(final_score, 6),
             "summary_scoring_details": summary_details,
+            "prompt_parity_sample": prompt_parity_detail,
         },
     }
 

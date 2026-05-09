@@ -3,8 +3,7 @@
   "query": {
     "query": "How are quantum cryptography advancements impacting cybersecurity practices",
     "tools": [
-      "Twitter Search",
-      "Reddit Search"
+      "ArXiv Search"
     ],
     "date_filter_type": "PAST_24_HOURS"
   },
