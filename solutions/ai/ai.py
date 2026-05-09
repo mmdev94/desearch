@@ -44,12 +44,16 @@ _DEFAULT_MAX_ITEMS = 20
 _MIN_SOLUTION_WALL_SECONDS = 5.5
 _TWITTER_FETCH_ITEMS = 30
 _OTHER_FETCH_ITEMS = 30
-# Selection caps (local rank only; no LLM). Mixed tool tasks: 5 twitter + 5 web for miner (10 total).
-_MAX_FINAL_SOURCES = 10
+# Selection caps (local rank only; no LLM). Mixed (twitter + any non-twitter tools): 10 + 10 (20 total).
+_MAX_FINAL_SOURCES = 20
 _TOP_TWITTER_SOLO = 10
 _TOP_WEB_SOLO = 10
-_TOP_TWITTER_MIXED = 5
-_TOP_WEB_MIXED = 5
+_TOP_TWITTER_MIXED = 10
+_TOP_WEB_MIXED = 10
+# Label LLM: same desearch Q/A template per link; 5 links per request, parallel batches.
+_LABEL_BATCH_SIZE = 5
+_LABEL_BATCH_TIMEOUT = 4.0
+_MAX_CONCURRENT_LABEL_BATCHES = 8
 # Summary LLM only sees this many top-ranked sources (compact prompt).
 _SUMMARY_LLM_SOURCE_COUNT = 5
 _SUMMARY_LLM_SNIPPET_CHARS = 480
@@ -423,23 +427,52 @@ def _validator_score_to_relevance(score: float) -> ContextualRelevance:
     return ContextualRelevance.HIGH
 
 
-def _format_batch_label_user_content(
-    task_question: str, sources: list[UnifiedSource]
+def _format_desearch_label_batch_user(
+    task_question: str,
+    sources_batch: list[UnifiedSource],
+    global_offset: int,
 ) -> str:
-    """Batched Title+Description per source; same Question for all (validator-style)."""
+    """
+    One desearch SearchSummaryRelevance user_message_question_answer_template block per source
+    (same prompt shape as validator); JSON scoring instruction appended once for the batch.
+    """
+    q = task_question.strip()[:2000]
+    indices = [global_offset + i + 1 for i in range(len(sources_batch))]
+    indices_str = ", ".join(str(i) for i in indices)
+
+    if SearchSummaryRelevancePrompt is not None:
+        sp = SearchSummaryRelevancePrompt()
+        blocks: list[str] = []
+        for i, s in enumerate(sources_batch):
+            gidx = global_offset + i + 1
+            title = (s.title or "").replace("\n", " ").strip()
+            desc = _snippet_for_prompt(s.snippet or title, 800)
+            answer = f"Title: {title}\nDescription: {desc}"
+            blocks.append(f"=== Source index {gidx} ===\n{sp.text(q, answer)}")
+        return (
+            "\n\n".join(blocks)
+            + "\n\nFor EACH source index above ("
+            + indices_str
+            + "), assign one relevance score: 2, 5, or 9 per the system guide. "
+            "Return JSON only: {\"scores\":[{\"index\":<int>,\"score\":<2|5|9>},...]} "
+            f"with exactly {len(sources_batch)} objects, one per index."
+        )
+
     lines = [
         "For EACH numbered source, assign one relevance score: 2, 5, or 9 (see system guide).",
-        "Return JSON only: {\"scores\":[{\"index\":1,\"score\":5},...]} with exactly one object per source index.",
+        "Return JSON only: {\"scores\":[{\"index\":<n>,\"score\":<2|5|9>},...]} "
+        "with exactly one object per source index.",
         "",
-        f"Question:\n{task_question.strip()[:2000]}",
+        f"Question:\n{q}",
         "",
         "Sources (Title + Description = title + snippet):",
     ]
-    for i, s in enumerate(sources, 1):
+    for i, s in enumerate(sources_batch):
+        gidx = global_offset + i + 1
         title = (s.title or "").replace("\n", " ").strip()
         desc = _snippet_for_prompt(s.snippet or title, 800)
-        lines.append(f"{i}. Title: {title}")
-        lines.append(f"   Description: {desc}")
+        lines.append(f"{gidx}. Title: {title}")
+        lines.append(f"    Description: {desc}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -502,41 +535,42 @@ async def _run_compact_summary_llm(
         return _ensure_summary_structure(_build_fast_cited_summary(query, llm_sources))
 
 
-async def _run_link_labels_llm(
+async def _run_single_label_batch_llm(
     client: AsyncOpenAI,
     query: str,
-    all_sources: list[UnifiedSource],
+    batch: list[UnifiedSource],
+    global_offset: int,
 ) -> dict[str, ContextualRelevance]:
-    """
-    Second LLM call: desearch SearchSummaryRelevance system prompt; batched 2/5/9 for miner_link_scores.
-    """
-    if not all_sources:
+    """One JSON-object completion for up to _LABEL_BATCH_SIZE sources (global 1-based indices)."""
+    if not batch:
         return {}
     system = _search_relevance_system_message()
-    user = _format_batch_label_user_content(query, all_sources)
-    _log("summary_llm_labels_USER<<<BEGIN>>>")
-    _log(user)
-    _log("summary_llm_labels_USER<<<END>>>")
+    user = _format_desearch_label_batch_user(query, batch, global_offset)
+    _log(
+        f"summary_llm_labels_batch offset={global_offset} "
+        f"n={len(batch)} chars={len(user)}"
+    )
     try:
         resp = await client.chat.completions.create(
             model=_SUMMARY_MODEL,
             temperature=0.1,
             response_format={"type": "json_object"},
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            timeout=4.0,
+            timeout=_LABEL_BATCH_TIMEOUT,
         )
         raw = (resp.choices[0].message.content or "").strip()
         parsed = json.loads(raw or "{}")
         rows = parsed.get("scores") or parsed.get("evaluations") or []
         out: dict[str, ContextualRelevance] = {}
+        hi = global_offset + len(batch)
         for row in rows:
             try:
                 idx = int(row.get("index"))
             except (TypeError, ValueError):
                 continue
-            if idx < 1 or idx > len(all_sources):
+            if idx < global_offset + 1 or idx > hi:
                 continue
-            src = all_sources[idx - 1]
+            src = batch[idx - global_offset - 1]
             key = (src.score_key or src.link).strip()
             if not key:
                 continue
@@ -547,14 +581,47 @@ async def _run_link_labels_llm(
                 out[key] = _validator_score_to_relevance(float(sc))
             except (TypeError, ValueError):
                 continue
-        for s in all_sources:
-            key = (s.score_key or s.link).strip()
-            if key and key not in out:
-                out[key] = ContextualRelevance.MEDIUM
         return out
     except Exception as e:
-        _log(f"labels_llm_branch_error={type(e).__name__}: {e}")
-        return _miner_link_scores_raw_keywords(query, all_sources)
+        _log(
+            f"labels_llm_batch_error offset={global_offset} "
+            f"{type(e).__name__}: {e}"
+        )
+        return _miner_link_scores_raw_keywords(query, batch)
+
+
+async def _run_link_labels_llm(
+    client: AsyncOpenAI,
+    query: str,
+    all_sources: list[UnifiedSource],
+) -> dict[str, ContextualRelevance]:
+    """
+    SearchSummaryRelevance system + desearch Q/A user blocks per source; JSON 2/5/9 scores.
+    Parallel batches of _LABEL_BATCH_SIZE links share the same prompt pattern.
+    """
+    if not all_sources:
+        return {}
+    n = len(all_sources)
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_LABEL_BATCHES)
+
+    async def _guarded(off: int, chunk: list[UnifiedSource]) -> dict[str, ContextualRelevance]:
+        async with sem:
+            return await _run_single_label_batch_llm(client, query, chunk, off)
+
+    chunks: list[tuple[int, list[UnifiedSource]]] = []
+    for off in range(0, n, _LABEL_BATCH_SIZE):
+        piece = all_sources[off : off + _LABEL_BATCH_SIZE]
+        chunks.append((off, piece))
+
+    parts = await asyncio.gather(*[_guarded(off, piece) for off, piece in chunks])
+    out: dict[str, ContextualRelevance] = {}
+    for d in parts:
+        out.update(d)
+    for s in all_sources:
+        key = (s.score_key or s.link).strip()
+        if key and key not in out:
+            out[key] = ContextualRelevance.MEDIUM
+    return out
 
 
 def _ensure_minimum_source_citations(
@@ -974,8 +1041,8 @@ def _pick_selected_sources(
     """
     Local ranking only (no LLM).
     - Twitter only: top 10 tweets.
-    - Web only: top 10 links (all web-family tools combined).
-    - Twitter + web: top 5 tweets + top 5 web (10 total); tweets first, then web.
+    - No twitter: top 10 non-twitter links (all enabled tools combined).
+    - Twitter + other tools: top 10 tweets + top 10 non-twitter (20 max); tweets first, then others.
     """
     raw_by_link = _raw_item_by_canonical_link(by_tool)
 
@@ -1019,7 +1086,7 @@ async def _build_summary_from_selected(
     summary_sources: list[UnifiedSource],
 ) -> tuple[str, dict[str, ContextualRelevance]]:
     """
-    Miner scores use all summary_sources (up to 10). LLM sees only the first
+    Miner scores use all summary_sources (up to _MAX_FINAL_SOURCES). LLM sees only the first
     _SUMMARY_LLM_SOURCE_COUNT sources as compact title/snippet blocks; cites [n] then we expand to URLs.
     """
     if not summary_sources:
