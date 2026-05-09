@@ -1050,10 +1050,15 @@ async def _build_summary_from_selected(
     date_filter_type: str | None,
     summary_sources: list[UnifiedSource],
     scoring_system_message: str | None = None,
+    labels_query: str | None = None,
 ) -> tuple[str, dict[str, ContextualRelevance]]:
     """
     Miner scores use all summary_sources (up to _MAX_FINAL_SOURCES). LLM sees only the first
     _SUMMARY_LLM_SOURCE_COUNT sources as compact title/snippet blocks; cites [n] then we expand to URLs.
+
+    ``query`` drives the summary LLM (often planned / shortened). ``labels_query`` is used for
+    relevance labels only; defaults to ``query`` when omitted — pass the original synapse prompt
+    so validator parity matches response.prompt.
     """
     if not summary_sources:
         return (
@@ -1061,19 +1066,20 @@ async def _build_summary_from_selected(
             "**Conclusion**\nThe query needs broader terms or updated data.",
             {},
         )
+    label_q = labels_query if labels_query is not None else query
     llm_sources = summary_sources[:_SUMMARY_LLM_SOURCE_COUNT]
     client = _openai_client()
     t_parallel = time.perf_counter()
     try:
         summary_text, miner_scores = await asyncio.gather(
             _run_compact_summary_llm(client, query, llm_sources),
-            _run_link_labels_llm(client, query, summary_sources, scoring_system_message),
+            _run_link_labels_llm(client, label_q, summary_sources, scoring_system_message),
         )
     except Exception:
         summary_text = _ensure_summary_structure(
             _build_fast_cited_summary(query, llm_sources)
         )
-        miner_scores = _miner_link_scores_raw_keywords(query, summary_sources)
+        miner_scores = _miner_link_scores_raw_keywords(label_q, summary_sources)
     _log(f"timing.parallel_summary_and_labels={time.perf_counter() - t_parallel:.3f}s")
     return summary_text, miner_scores
 
@@ -1228,6 +1234,7 @@ async def run_ai_solution(
         synapse.date_filter_type,
         summary_sources=selected_rows,
         scoring_system_message=getattr(synapse, "scoring_system_message", None),
+        labels_query=prompt,
     )
     summary_stage_elapsed = time.perf_counter() - summary_stage_start
     _log(
