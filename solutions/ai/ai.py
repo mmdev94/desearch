@@ -57,12 +57,10 @@ _TOP_TWITTER_SOLO = 10
 _TOP_WEB_SOLO = 10
 _TOP_TWITTER_MIXED = 10
 _TOP_WEB_MIXED = 10
-# Label LLM: RewardLLM parity (reward_llm.py uses temperature 0.5 for gpt-4.1-nano).
+# Label LLM: same call shape as WebSearchContentRelevanceModel / RewardLLM (one link per request).
 _LABEL_TEMPERATURE = 0.5
-# Same desearch Q/A template per link; 5 links per request, parallel batches.
-_LABEL_BATCH_SIZE = 5
-_LABEL_BATCH_TIMEOUT = 4.0
-_MAX_CONCURRENT_LABEL_BATCHES = 8
+_LABEL_TIMEOUT = 4.0
+_MAX_CONCURRENT_LABEL_WORKERS = 20
 # Summary LLM only sees this many top-ranked sources (compact prompt).
 _SUMMARY_LLM_SOURCE_COUNT = 5
 _SUMMARY_LLM_SNIPPET_CHARS = 480
@@ -453,49 +451,21 @@ def _validator_score_to_relevance(score: float) -> ContextualRelevance:
     return ContextualRelevance.HIGH
 
 
-def _format_desearch_label_batch_user(
-    task_question: str,
-    sources_batch: list[UnifiedSource],
-    global_offset: int,
-) -> str:
+def _validator_single_link_user_message(task_question: str, source: UnifiedSource) -> str:
     """
-    One desearch SearchSummaryRelevance user_message_question_answer_template block per source
-    (same prompt shape as validator); JSON scoring instruction appended once for the batch.
+    Exact user message as SearchSummaryRelevancePrompt.text(prompt, content) — no wrappers,
+    no JSON suffix (WebSearchContentRelevanceModel / TwitterContentRelevanceModel parity).
     """
     q = task_question.strip()[:2000]
-    indices = [global_offset + i + 1 for i in range(len(sources_batch))]
-    indices_str = ", ".join(str(i) for i in indices)
-
+    answer = _validator_style_answer_content(source)
     if SearchSummaryRelevancePrompt is not None:
-        sp = SearchSummaryRelevancePrompt()
-        blocks: list[str] = []
-        for i, s in enumerate(sources_batch):
-            gidx = global_offset + i + 1
-            answer = _validator_style_answer_content(s)
-            blocks.append(f"=== Source index {gidx} ===\n{sp.text(q, answer)}")
-        return (
-            "\n\n".join(blocks)
-            + "\n\nFor EACH source index above ("
-            + indices_str
-            + "), assign one relevance score: 2, 5, or 9 per the system guide. "
-            "Return JSON only: {\"scores\":[{\"index\":<int>,\"score\":<2|5|9>},...]} "
-            f"with exactly {len(sources_batch)} objects, one per index."
-        )
-
-    lines = [
-        "For EACH numbered source, assign one relevance score: 2, 5, or 9 (see system guide).",
-        "Return JSON only: {\"scores\":[{\"index\":<n>,\"score\":<2|5|9>},...]} "
-        "with exactly one object per source index.",
-        "",
-        f"Question:\n{q}",
-        "",
-        "Sources (Title + Description = title + snippet):",
-    ]
-    for i, s in enumerate(sources_batch):
-        gidx = global_offset + i + 1
-        lines.append(f"{gidx}. {_validator_style_answer_content(s)}")
-        lines.append("")
-    return "\n".join(lines).strip()
+        return SearchSummaryRelevancePrompt().text(q, answer)
+    return (
+        f"Here is the question:\n<Question>\n{q}\n</Question>\n\n"
+        f"And the answer content:\n<Answer>\n{answer}\n</Answer>\n\n"
+        "Please evaluate the above <Question></Question> and <Answer></Answer> "
+        "using relevance Scoring Guide in the system message."
+    )
 
 
 async def _run_compact_summary_llm(
@@ -556,60 +526,39 @@ async def _run_compact_summary_llm(
         return _ensure_summary_structure(_build_fast_cited_summary(query, llm_sources))
 
 
-async def _run_single_label_batch_llm(
+async def _run_single_source_label_llm(
     client: AsyncOpenAI,
     query: str,
-    batch: list[UnifiedSource],
-    global_offset: int,
+    source: UnifiedSource,
     scoring_system_message: str | None = None,
 ) -> dict[str, ContextualRelevance]:
-    """One JSON-object completion for up to _LABEL_BATCH_SIZE sources (global 1-based indices)."""
-    if not batch:
-        return {}
+    """
+    One completion per source: same messages as validator reward models, free-text score,
+    SearchSummaryRelevancePrompt.extract_score → snap to 2/5/9 buckets.
+    """
     system = _search_relevance_system_message(scoring_system_message)
-    user = _format_desearch_label_batch_user(query, batch, global_offset)
-    _log(
-        f"summary_llm_labels_batch offset={global_offset} "
-        f"n={len(batch)} chars={len(user)} temp={_LABEL_TEMPERATURE}"
-    )
+    user = _validator_single_link_user_message(query, source)
+    key = (source.score_key or source.link).strip()
+    if not key:
+        return {}
     try:
         resp = await client.chat.completions.create(
             model=_SUMMARY_MODEL,
             temperature=_LABEL_TEMPERATURE,
-            response_format={"type": "json_object"},
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            timeout=_LABEL_BATCH_TIMEOUT,
+            timeout=_LABEL_TIMEOUT,
         )
         raw = (resp.choices[0].message.content or "").strip()
-        parsed = json.loads(raw or "{}")
-        rows = parsed.get("scores") or parsed.get("evaluations") or []
-        out: dict[str, ContextualRelevance] = {}
-        hi = global_offset + len(batch)
-        for row in rows:
-            try:
-                idx = int(row.get("index"))
-            except (TypeError, ValueError):
-                continue
-            if idx < global_offset + 1 or idx > hi:
-                continue
-            src = batch[idx - global_offset - 1]
-            key = (src.score_key or src.link).strip()
-            if not key:
-                continue
-            sc = row.get("score")
-            if sc is None and row.get("validator_score") is not None:
-                sc = row.get("validator_score")
-            try:
-                out[key] = _validator_score_to_relevance(float(sc))
-            except (TypeError, ValueError):
-                continue
-        return out
+        if SearchSummaryRelevancePrompt is not None:
+            num = float(SearchSummaryRelevancePrompt().extract_score(raw))
+        else:
+            m = re.search(r"(?i)score[:\s]*([0-9]|10)", raw)
+            num = float(m.group(1)) if m else 5.0
+        rel = _validator_score_to_relevance(_snap_to_validator_score(num))
+        return {key: rel}
     except Exception as e:
-        _log(
-            f"labels_llm_batch_error offset={global_offset} "
-            f"{type(e).__name__}: {e}"
-        )
-        return _miner_link_scores_raw_keywords(query, batch)
+        _log(f"labels_llm_single_error key={key[:48]} {type(e).__name__}: {e}")
+        return _miner_link_scores_raw_keywords(query, [source])
 
 
 async def _run_link_labels_llm(
@@ -618,34 +567,25 @@ async def _run_link_labels_llm(
     all_sources: list[UnifiedSource],
     scoring_system_message: str | None = None,
 ) -> dict[str, ContextualRelevance]:
-    """
-    SearchSummaryRelevance system + desearch Q/A user blocks per source; JSON 2/5/9 scores.
-    Parallel batches of _LABEL_BATCH_SIZE links share the same prompt pattern.
-    """
+    """Up to _MAX_CONCURRENT_LABEL_WORKERS parallel single-link scorer calls (validator-shaped)."""
     if not all_sources:
         return {}
-    n = len(all_sources)
-    sem = asyncio.Semaphore(_MAX_CONCURRENT_LABEL_BATCHES)
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_LABEL_WORKERS)
 
-    async def _guarded(off: int, chunk: list[UnifiedSource]) -> dict[str, ContextualRelevance]:
+    async def _one(src: UnifiedSource) -> dict[str, ContextualRelevance]:
         async with sem:
-            return await _run_single_label_batch_llm(
-                client, query, chunk, off, scoring_system_message
+            return await _run_single_source_label_llm(
+                client, query, src, scoring_system_message
             )
 
-    chunks: list[tuple[int, list[UnifiedSource]]] = []
-    for off in range(0, n, _LABEL_BATCH_SIZE):
-        piece = all_sources[off : off + _LABEL_BATCH_SIZE]
-        chunks.append((off, piece))
-
-    parts = await asyncio.gather(*[_guarded(off, piece) for off, piece in chunks])
+    parts = await asyncio.gather(*[_one(s) for s in all_sources])
     out: dict[str, ContextualRelevance] = {}
     for d in parts:
         out.update(d)
     for s in all_sources:
-        key = (s.score_key or s.link).strip()
-        if key and key not in out:
-            out[key] = ContextualRelevance.MEDIUM
+        k = (s.score_key or s.link).strip()
+        if k and k not in out:
+            out.update(_miner_link_scores_raw_keywords(query, [s]))
     return out
 
 
