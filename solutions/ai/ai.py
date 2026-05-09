@@ -36,6 +36,13 @@ try:
 except ImportError:
     SearchSummaryRelevancePrompt = None  # type: ignore[misc, assignment]
 
+try:
+    from desearch.utils import clean_text as _validator_clean_text
+except ImportError:
+
+    def _validator_clean_text(text: str | None) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip())
+
 _QUERY_MODEL = "gpt-4.1-nano"
 _SUMMARY_MODEL = "gpt-4.1-nano"
 
@@ -50,7 +57,9 @@ _TOP_TWITTER_SOLO = 10
 _TOP_WEB_SOLO = 10
 _TOP_TWITTER_MIXED = 10
 _TOP_WEB_MIXED = 10
-# Label LLM: same desearch Q/A template per link; 5 links per request, parallel batches.
+# Label LLM: RewardLLM parity (reward_llm.py uses temperature 0.5 for gpt-4.1-nano).
+_LABEL_TEMPERATURE = 0.5
+# Same desearch Q/A template per link; 5 links per request, parallel batches.
 _LABEL_BATCH_SIZE = 5
 _LABEL_BATCH_TIMEOUT = 4.0
 _MAX_CONCURRENT_LABEL_BATCHES = 8
@@ -403,10 +412,27 @@ Score: [2, 5, or 9], Explanation:
 """
 
 
-def _search_relevance_system_message() -> str:
+def _search_relevance_system_message(override: str | None = None) -> str:
+    if override and str(override).strip():
+        return str(override).strip()
     if SearchSummaryRelevancePrompt is not None:
         return SearchSummaryRelevancePrompt().get_system_message()
     return _FALLBACK_SEARCH_RELEVANCE_SYSTEM.strip()
+
+
+def _validator_style_answer_content(source: UnifiedSource) -> str:
+    """
+    Match validator reward models:
+    - WebSearchContentRelevanceModel: Title + Description, then clean_text on the combined string.
+    - TwitterContentRelevanceModel: tweet body only, clean_text (no Title/Description wrapper).
+    """
+    if source.tool_key == "twitter":
+        raw = (source.snippet or source.title or "").strip()
+        return _validator_clean_text(raw)
+    title = (source.title or "").strip()
+    desc = (source.snippet or title or "").strip()
+    combined = f"Title: {title}, Description: {desc}"
+    return _validator_clean_text(combined)
 
 
 def _snap_to_validator_score(x: float) -> float:
@@ -445,9 +471,7 @@ def _format_desearch_label_batch_user(
         blocks: list[str] = []
         for i, s in enumerate(sources_batch):
             gidx = global_offset + i + 1
-            title = (s.title or "").replace("\n", " ").strip()
-            desc = _snippet_for_prompt(s.snippet or title, 800)
-            answer = f"Title: {title}\nDescription: {desc}"
+            answer = _validator_style_answer_content(s)
             blocks.append(f"=== Source index {gidx} ===\n{sp.text(q, answer)}")
         return (
             "\n\n".join(blocks)
@@ -469,10 +493,7 @@ def _format_desearch_label_batch_user(
     ]
     for i, s in enumerate(sources_batch):
         gidx = global_offset + i + 1
-        title = (s.title or "").replace("\n", " ").strip()
-        desc = _snippet_for_prompt(s.snippet or title, 800)
-        lines.append(f"{gidx}. Title: {title}")
-        lines.append(f"    Description: {desc}")
+        lines.append(f"{gidx}. {_validator_style_answer_content(s)}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -540,20 +561,21 @@ async def _run_single_label_batch_llm(
     query: str,
     batch: list[UnifiedSource],
     global_offset: int,
+    scoring_system_message: str | None = None,
 ) -> dict[str, ContextualRelevance]:
     """One JSON-object completion for up to _LABEL_BATCH_SIZE sources (global 1-based indices)."""
     if not batch:
         return {}
-    system = _search_relevance_system_message()
+    system = _search_relevance_system_message(scoring_system_message)
     user = _format_desearch_label_batch_user(query, batch, global_offset)
     _log(
         f"summary_llm_labels_batch offset={global_offset} "
-        f"n={len(batch)} chars={len(user)}"
+        f"n={len(batch)} chars={len(user)} temp={_LABEL_TEMPERATURE}"
     )
     try:
         resp = await client.chat.completions.create(
             model=_SUMMARY_MODEL,
-            temperature=0.1,
+            temperature=_LABEL_TEMPERATURE,
             response_format={"type": "json_object"},
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             timeout=_LABEL_BATCH_TIMEOUT,
@@ -594,6 +616,7 @@ async def _run_link_labels_llm(
     client: AsyncOpenAI,
     query: str,
     all_sources: list[UnifiedSource],
+    scoring_system_message: str | None = None,
 ) -> dict[str, ContextualRelevance]:
     """
     SearchSummaryRelevance system + desearch Q/A user blocks per source; JSON 2/5/9 scores.
@@ -606,7 +629,9 @@ async def _run_link_labels_llm(
 
     async def _guarded(off: int, chunk: list[UnifiedSource]) -> dict[str, ContextualRelevance]:
         async with sem:
-            return await _run_single_label_batch_llm(client, query, chunk, off)
+            return await _run_single_label_batch_llm(
+                client, query, chunk, off, scoring_system_message
+            )
 
     chunks: list[tuple[int, list[UnifiedSource]]] = []
     for off in range(0, n, _LABEL_BATCH_SIZE):
@@ -1084,6 +1109,7 @@ async def _build_summary_from_selected(
     query: str,
     date_filter_type: str | None,
     summary_sources: list[UnifiedSource],
+    scoring_system_message: str | None = None,
 ) -> tuple[str, dict[str, ContextualRelevance]]:
     """
     Miner scores use all summary_sources (up to _MAX_FINAL_SOURCES). LLM sees only the first
@@ -1101,7 +1127,7 @@ async def _build_summary_from_selected(
     try:
         summary_text, miner_scores = await asyncio.gather(
             _run_compact_summary_llm(client, query, llm_sources),
-            _run_link_labels_llm(client, query, summary_sources),
+            _run_link_labels_llm(client, query, summary_sources, scoring_system_message),
         )
     except Exception:
         summary_text = _ensure_summary_structure(
@@ -1261,6 +1287,7 @@ async def run_ai_solution(
         planned_query,
         synapse.date_filter_type,
         summary_sources=selected_rows,
+        scoring_system_message=getattr(synapse, "scoring_system_message", None),
     )
     summary_stage_elapsed = time.perf_counter() - summary_stage_start
     _log(

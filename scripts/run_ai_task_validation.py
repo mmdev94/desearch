@@ -31,6 +31,67 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _miner_link_score_lookup(miner_scores: dict, link: Any) -> Any:
+    """Resolve miner_link_scores value for validator keys (str/int tweet ids, URLs)."""
+    if link in miner_scores:
+        return miner_scores[link]
+    s = str(link)
+    if s in miner_scores:
+        return miner_scores[s]
+    try:
+        ik = int(s)
+        if ik in miner_scores:
+            return miner_scores[ik]
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _label_parity_rows(
+    synapse,
+    twitter_scores: dict[Any, Any],
+    web_scores: dict[Any, Any],
+) -> list[dict[str, Any]]:
+    """Side-by-side validator numeric scores vs miner ContextualRelevance (miner_score_penalty parity)."""
+    from neurons.validators.penalty.miner_score_penalty import score_to_contextual_relevance
+
+    miner_raw = dict(getattr(synapse, "miner_link_scores", None) or {})
+
+    def _enum_label(v: Any) -> str | None:
+        if v is None:
+            return None
+        return getattr(v, "value", str(v))
+
+    rows: list[dict[str, Any]] = []
+
+    def _add(reward_model: str, vdict: dict[str, Any]) -> None:
+        for link, raw_score in (vdict or {}).items():
+            vb = score_to_contextual_relevance(float(raw_score))
+            if vb is not None:
+                v_lab = _enum_label(vb)
+            else:
+                v_lab = None
+            m_obj = _miner_link_score_lookup(miner_raw, link)
+            m_lab = _enum_label(m_obj) if m_obj is not None else None
+            rows.append(
+                {
+                    "reward_model": reward_model,
+                    "link_key": str(link)[:800],
+                    "validator_numeric_score": raw_score,
+                    "validator_bucket": v_lab,
+                    "validator_unmapped": vb is None,
+                    "miner_bucket": m_lab,
+                    "match": bool(
+                        v_lab is not None and m_lab is not None and v_lab == m_lab
+                    ),
+                }
+            )
+
+    _add("twitter_content_relevance", twitter_scores)
+    _add("search_content_relevance", web_scores)
+    return rows
+
+
 def _bootstrap_source_imports() -> None:
     repo_root = _repo_root()
     source_root = repo_root / "source"
@@ -382,9 +443,27 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         val_score_responses_list.append(val_score_responses)
     reward_stage_elapsed = time.perf_counter() - reward_stage_start
 
-    web_grouped_scores: dict[str, Any] = {}
-    if len(val_score_responses_list) > 1 and val_score_responses_list[1]:
-        web_grouped_scores = val_score_responses_list[1][0] or {}
+    tw_val_scores: dict[str, Any] = {}
+    web_val_scores: dict[str, Any] = {}
+    if len(val_score_responses_list) > 0:
+        blk = val_score_responses_list[0]
+        if isinstance(blk, list) and len(blk) > 0:
+            tw_val_scores = blk[0] or {}
+    if len(val_score_responses_list) > 1:
+        blk = val_score_responses_list[1]
+        if isinstance(blk, list) and len(blk) > 0:
+            web_val_scores = blk[0] or {}
+
+    web_grouped_scores = web_val_scores
+
+    label_parity_rows = _label_parity_rows(synapse, tw_val_scores, web_val_scores)
+    print("[ai-validation-label-parity]")
+    for row in label_parity_rows:
+        print(
+            f"  {row['reward_model']} key={row['link_key'][:140]} "
+            f"val_score={row['validator_numeric_score']} val_bucket={row['validator_bucket']} "
+            f"miner_bucket={row['miner_bucket']} match={row['match']}"
+        )
 
     search_content_zero_diagnostic: dict[str, Any] | None = None
     if float(model_scores.get("search_content_relevance") or 0) <= 0:
@@ -489,6 +568,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 k: getattr(v, "value", str(v))
                 for k, v in (getattr(synapse, "miner_link_scores", None) or {}).items()
             },
+            "label_parity": label_parity_rows,
             "reward_weights": {
                 "twitter_content_relevance": round(weights[0], 6),
                 "search_content_relevance": round(weights[1], 6),
